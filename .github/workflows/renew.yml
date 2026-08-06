@@ -3,7 +3,7 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 05 * * 0'   # 每周日 05:30 UTC，可根据需要修改
+    - cron: '30 05 * * 3'   # 每周日 05:30 UTC，可根据需要修改
 
 permissions:
   actions: write
