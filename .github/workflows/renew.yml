@@ -1,9 +1,9 @@
-name: Auto Renew HidenCloud 
+name: Auto Renew HidenCloud
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 05 * * 0' # 根据到期时间在星期几 提前一天,比如星期三到期，cron写星期二即可
+    - cron: '30 05 * * 0'   # 每周日 05:30 UTC，可根据需要修改
 
 permissions:
   actions: write
@@ -28,23 +28,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
           pip install playwright requests 'requests[socks]'
-          python -m playwright install --with-deps chrome
-          
+          python -m playwright install --with-deps chromium   # 使用 Chromium
+
       - name: ⚙ 设置代理 (sing-box)
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}   # 代理节点链接，需在 Secrets 中配置
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          
+
       - name: 🚀 运行续期脚本
         env:
+          # 多账号 JSON（可选），若配置则忽略下方单账号凭证
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          # 单账号兼容（可保留，当 ACCOUNTS_JSON 为空时生效）
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
+          # Telegram 通知
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          IS_PROXY: ${{ env.IS_PROXY }}
-          PROXY_SERVER: ${{ env.PROXY_SERVER }}
+          # 代理配置（固定值，因为代理脚本已在本地启动）
+          IS_PROXY: 'true'
+          PROXY_SERVER: 'socks5://127.0.0.1:1080'
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
       - name: 🧽 清理进程和临时文件
