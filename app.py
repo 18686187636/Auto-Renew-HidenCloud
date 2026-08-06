@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os, re, sys, time, random, requests, json
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用,TG通知需要填写
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
+COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # 单账号使用
+EMAIL        = os.environ.get('EMAIL') or ""
+PASSWORD     = os.environ.get('PASSWORD') or ""
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
+ACCOUNTS_JSON = os.environ.get('ACCOUNTS_JSON') or ""  # 多账号 JSON
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
+# 代理配置
 IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -33,7 +34,6 @@ def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -41,23 +41,23 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due):
-    """发送 Telegram 通知"""
+def send_telegram_notification(status, old_due, new_due, email):
+    """发送 Telegram 通知，增加 email 参数以标识账号"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
     
-    # 获取运行时间
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
+    # 脱敏邮箱
+    if '@' in email:
+        name, domain = email.split('@', 1)
         if len(name) > 4:
             masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****' 
+        masked_email = email[:2] + '****'
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
@@ -111,14 +111,15 @@ def handle_cloudflare(page):
     log("❌ 验证超时。")
     return False
 
-def login(page):
+def login(page, email, password, cookie_value):
+    """使用给定凭证登录，返回是否成功"""
     # 1. Cookie 登录尝试
-    if COOKIE_VALUE:
+    if cookie_value:
         log("📇 尝试 Cookie 登录...")
         try:
             page.context.add_cookies([{
                 'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': COOKIE_VALUE,
+                'value': cookie_value,
                 'domain': 'dash.hidencloud.com',
                 'path': '/',
                 'expires': int(time.time()) + 3600 * 24 * 365,
@@ -138,14 +139,14 @@ def login(page):
             pass
 
     # 2. 账号密码登录
-    if not EMAIL or not PASSWORD:
+    if not email or not password:
         return False
     log("💣 尝试账号密码登录...")
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        page.fill('input[name="email"]', EMAIL)
-        page.fill('input[name="password"]', PASSWORD)
+        page.fill('input[name="email"]', email)
+        page.fill('input[name="password"]', password)
         time.sleep(0.5)
         handle_cloudflare(page)
         page.click('button[type="submit"]')
@@ -173,14 +174,12 @@ def get_server_id(page):
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
-        # 方案1: 从 href 链接中提取 /service/数字/manage
         matches = re.findall(r'/service/(\d+)/manage', html)
         if matches:
             server_id = matches[0]
             log(f"✅ 从链接中获取到 Server ID: {server_id}")
             return server_id
 
-        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")
         matches = re.findall(r'#(\d{4,})', html)
         if matches:
             server_id = matches[0]
@@ -194,10 +193,10 @@ def get_server_id(page):
         page.screenshot(path="server_id_error.png")
         return None
 
-def get_due_date(page):
+def get_due_date(page, service_url):
     try:
-        if SERVICE_URL not in page.url:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        if service_url not in page.url:
+            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         body_text = page.locator("body").inner_text()
         patterns = [
@@ -215,12 +214,11 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service(page):
-
+def renew_service(page, service_url):
     try:
         log("➡ 进入续期流程...")
-        if page.url != SERVICE_URL:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        if page.url != service_url:
+            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
         log("🖱️ 准备点击 'Renew' 按钮...")
@@ -235,13 +233,12 @@ def renew_service(page):
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(2)
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                    return "NOT_TIME"
 
                 log("🖲️ 等待弹窗出现...")
                 try:
@@ -291,10 +288,8 @@ def renew_service(page):
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
         time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         return True
 
@@ -303,83 +298,127 @@ def renew_service(page):
         page.screenshot(path="renew_error.png")
         return False
 
+def process_account(email, password, cookie_value, browser):
+    """处理单个账号的续期，返回 (status, old_due, new_due)"""
+    log(f"=== 开始处理账号: {email} ===")
+    context = browser.new_context(
+        viewport={'width': 1920, 'height': 1080},
+        user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        proxy={"server": PROXY_SERVER} if IS_PROXY else None
+    )
+    page = context.new_page()
+    page.add_init_script(STEALTH_JS)
+
+    try:
+        # 登录
+        if not login(page, email, password, cookie_value):
+            log(f"❌ 账号 {email} 登录失败，跳过续期")
+            return ("登录失败", "未知", "未知")
+
+        # 获取 Server ID
+        server_id = get_server_id(page)
+        if not server_id:
+            log(f"❌ 账号 {email} 无法获取 Server ID，跳过续期")
+            return ("获取Server ID失败", "未知", "未知")
+        service_url = f"{BASE_URL}/service/{server_id}/manage"
+
+        # 获取旧到期时间
+        old_due = get_due_date(page, service_url)
+        log(f"📆 续费前到期时间：{old_due}")
+
+        # 执行续期
+        renew_result = renew_service(page, service_url)
+
+        new_due = old_due
+        if renew_result == "NOT_TIME":
+            log("⏳ 未到续期时间，目前无法续期")
+            status = "⏳ 未到续期时间"
+        elif renew_result is False:
+            log("❌ 续费失败")
+            status = "❌ 续期失败"
+        else:
+            new_due = get_due_date(page, service_url)
+            log(f"📆 续费后到期时间：{new_due}")
+            status = "✅ 续期成功"
+
+        # 发送通知
+        send_telegram_notification(status, old_due, new_due, email)
+        return (status, old_due, new_due)
+
+    except Exception as e:
+        log(f"❌ 处理账号 {email} 时发生异常: {e}")
+        return ("异常", "未知", "未知")
+    finally:
+        context.close()
+
 def main():
-    # 检查必要环境变量
-    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
-        log("❌ 缺少登录凭证")
-        sys.exit(1)
+    # 检查必要凭证
+    if ACCOUNTS_JSON:
+        try:
+            accounts = json.loads(ACCOUNTS_JSON)
+            if not isinstance(accounts, list) or len(accounts) == 0:
+                log("❌ ACCOUNTS_JSON 格式错误：应为非空数组")
+                sys.exit(1)
+        except json.JSONDecodeError as e:
+            log(f"❌ ACCOUNTS_JSON 解析失败: {e}")
+            sys.exit(1)
+        log(f"📋 多账号模式，共 {len(accounts)} 个账号")
+    else:
+        # 单账号模式（兼容）
+        if not COOKIE_VALUE and not (EMAIL and PASSWORD):
+            log("❌ 缺少登录凭证，请提供 COOKIE_VALUE 或 EMAIL+PASSWORD")
+            sys.exit(1)
+        accounts = [{"email": EMAIL, "password": PASSWORD, "cookie": COOKIE_VALUE}]
+        log("📋 单账号模式")
 
-    global SERVICE_URL
+    # 获取出口IP
+    current_ip = get_current_ip(PROXY_SERVER if IS_PROXY else None)
+    log(f"🎯 当前出口IP: {current_ip}")
 
+    # 启动浏览器（只启动一次）
     with sync_playwright() as p:
         try:
-            if IS_PROXY:
-                log(f"⚙️ 代理已启用: {PROXY_SERVER}")
-            else:
-                log("🌐 直连模式（未使用代理）")
-            
-            # 获取当前出口ip
-            current_ip = get_current_ip(PROXY_SERVER)
-            log(f"🎯 当前出口IP: {current_ip}")
-
             log("🚀 启动浏览器...")
             browser = p.chromium.launch(
-                channel="chrome",
+                channel="chromium",   # 改为 chromium，确保在 Actions 中可用
                 headless=False,
                 args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
             )
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                proxy={"server": PROXY_SERVER} if IS_PROXY else None
-            )
-            page = context.new_page()
-            page.add_init_script(STEALTH_JS)
 
-            if not login(page):
-                sys.exit(1)
+            all_success = True
+            for idx, acc in enumerate(accounts):
+                email = acc.get('email', '')
+                password = acc.get('password', '')
+                cookie = acc.get('cookie', '')
+                if not email:
+                    log(f"⚠️ 第 {idx+1} 个账号缺少 email，跳过")
+                    continue
 
-            # 登录成功后，自动获取 Server ID
-            server_id = get_server_id(page)
-            if not server_id:
-                log("❌ 无法获取 Server ID，退出。")
-                sys.exit(1)
-            SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
+                status, old_due, new_due = process_account(email, password, cookie, browser)
 
-            # 获取旧到期时间
-            old_due = get_due_date(page)
-            log(f"📆 续费前到期时间：{old_due}")
+                # 如果状态不是成功或未到时间，视为失败
+                if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
+                    all_success = False
 
-            # 执行续费
-            renew_result = renew_service(page)
+                # 如果不是最后一个账号，等待3分钟
+                if idx < len(accounts) - 1:
+                    log(f"⏳ 等待 3 分钟后处理下一个账号...")
+                    time.sleep(180)
 
-            new_due = old_due
-            if renew_result == "NOT_TIME":
-                log("⏳ 未到续期时间，目前无法续期")
-                status = "⏳ 未到续期时间"
-            elif renew_result is False:
-                log("❌ 续费失败，脚本退出。")
-                status = "❌ 续期失败"
-            else:  # renew_result is True
-                new_due = get_due_date(page)
-                log(f"📆 续费后到期时间：{new_due}")
-                status = "✅ 续期成功"
-
-            # 发送 Telegram 通知
-            send_telegram_notification(status, old_due, new_due)
-
-            if renew_result == "NOT_TIME":
+            # 最终退出码
+            if all_success:
+                log("🎉 所有账号处理完毕（成功或未到期）")
                 sys.exit(0)
-            elif renew_result is False:
-                sys.exit(1)
             else:
-                sys.exit(0)
+                log("⚠️ 部分账号处理失败，请检查日志")
+                sys.exit(1)
+
         except Exception as e:
-            log(f"❌ 浏览器启动出错: {e}")
+            log(f"❌ 浏览器启动或运行出错: {e}")
             sys.exit(1)
         finally:
             if 'browser' in locals() and browser:
                 browser.close()
-                
+
 if __name__ == "__main__":
     main()
