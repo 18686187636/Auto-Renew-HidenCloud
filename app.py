@@ -111,6 +111,52 @@ def handle_cloudflare(page):
     log("❌ 验证超时。")
     return False
 
+def close_cookie_consent(page):
+    """
+    检测并关闭页面上的 Cookie 同意弹窗（如 fc-consent-root）。
+    支持多种弹窗样式。
+    """
+    try:
+        # 等待弹窗出现（最多 3 秒）
+        consent_root = page.locator('.fc-consent-root')
+        if consent_root.count() == 0:
+            return  # 没有弹窗
+
+        log("🍪 检测到 Cookie 同意弹窗，尝试关闭...")
+
+        # 常见按钮文本和选择器
+        accept_selectors = [
+            'button:has-text("Accept")',
+            'button:has-text("Accept All")',
+            'button:has-text("I agree")',
+            'button:has-text("Allow")',
+            'button:has-text("OK")',
+            '.fc-cta-consent',  # 常见的类
+            '.fc-button:has-text("Accept")',
+        ]
+
+        for selector in accept_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    log("✅ 点击了接受按钮")
+                    # 等待弹窗消失
+                    page.wait_for_selector('.fc-consent-root', state='detached', timeout=5000)
+                    return
+            except:
+                continue
+
+        # 如果找不到按钮，尝试用 JavaScript 移除覆盖层（应急）
+        page.evaluate("""
+            document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-header').forEach(el => el.remove());
+        """)
+        log("⚠️ 未找到接受按钮，已通过 JS 移除覆盖层")
+
+    except Exception as e:
+        log(f"⚠️ 关闭 Cookie 弹窗时出错: {e}")
+        # 不中断流程
+
 def login(page, email, password, cookie_value):
     """使用给定凭证登录，返回是否成功"""
     # 1. Cookie 登录尝试
@@ -198,6 +244,7 @@ def get_due_date(page, service_url):
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        close_cookie_consent(page)  # 确保弹窗不遮挡内容
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -215,88 +262,89 @@ def get_due_date(page, service_url):
     return "未知"
 
 def renew_service(page, service_url):
-    try:
-        log("➡ 进入续期流程...")
-        if page.url != service_url:
-            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
+    log("➡ 进入续期流程...")
+    close_cookie_consent(page)  # 初始清理
 
-        log("🖱️ 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
-
-        modal_opened = False
-        for i in range(3):
-            try:
-                renew_btn.wait_for(state="visible", timeout=10000)
-                renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
-
-                time.sleep(2)
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"
-
-                log("🖲️ 等待弹窗出现...")
-                try:
-                    create_btn.wait_for(state="visible", timeout=5000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
-                    break
-                except:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
-            except Exception as e:
-                log(f"❌ 点击尝试出错: {e}")
-
-        if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
-            page.screenshot(path="renew_modal_failed.png")
-            return False
-
-        handle_cloudflare(page)
-        log("🖱️ 点击 'Create Invoice'...")
-        create_btn.click()
-
-        new_invoice_url = None
-        start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
-                break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                handle_cloudflare(page)
-            time.sleep(1)
-
-        if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
-            page.screenshot(path="renew_stuck_invoice.png")
-            return False
-
-        if page.url != new_invoice_url:
-            page.goto(new_invoice_url)
-        handle_cloudflare(page)
-
-        log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
-        log("✅ 'Pay' 按钮已点击。")
-
-        time.sleep(5)
+    if page.url != service_url:
         page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        return True
+    close_cookie_consent(page)  # 跳转后再次清理
+    handle_cloudflare(page)
 
-    except Exception as e:
-        log(f"❌ 续费异常: {e}")
-        page.screenshot(path="renew_error.png")
+    log("🖱️ 准备点击 'Renew' 按钮...")
+    renew_btn = page.locator('button:has-text("Renew")')
+    create_btn = page.locator('button:has-text("Create Invoice")')
+
+    modal_opened = False
+    for i in range(3):
+        try:
+            renew_btn.wait_for(state="visible", timeout=10000)
+            renew_btn.scroll_into_view_if_needed()
+            log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
+            # 点击前再次清理弹窗
+            close_cookie_consent(page)
+            renew_btn.click()
+
+            time.sleep(2)
+            page_text = page.locator("body").inner_text()
+            if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+                log("⚠️ 未到续期时间，无法续期。")
+                page.screenshot(path="renew_not_allowed.png")
+                return "NOT_TIME"
+
+            log("🖲️ 等待弹窗出现...")
+            try:
+                create_btn.wait_for(state="visible", timeout=5000)
+                modal_opened = True
+                log("✅ 弹窗已成功弹出！")
+                break
+            except:
+                log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                time.sleep(2)
+        except Exception as e:
+            log(f"❌ 点击尝试出错: {e}")
+
+    if not modal_opened:
+        log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+        page.screenshot(path="renew_modal_failed.png")
         return False
+
+    handle_cloudflare(page)
+    close_cookie_consent(page)  # 点击Create Invoice前清理
+    log("🖱️ 点击 'Create Invoice'...")
+    create_btn.click()
+
+    new_invoice_url = None
+    start_wait = time.time()
+    while time.time() - start_wait < 90:
+        if "/payment/invoice/" in page.url:
+            new_invoice_url = page.url
+            log(f"🎉 页面已跳转: {new_invoice_url}")
+            break
+        if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+            log("⚠️ 遇到拦截，尝试处理...")
+            handle_cloudflare(page)
+        time.sleep(1)
+
+    if not new_invoice_url:
+        log("❌ 未能进入发票页面，超时。")
+        page.screenshot(path="renew_stuck_invoice.png")
+        return False
+
+    if page.url != new_invoice_url:
+        page.goto(new_invoice_url)
+    handle_cloudflare(page)
+
+    log("🔎 查找 'Pay' 按钮...")
+    pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+    pay_btn.wait_for(state="visible", timeout=30000)
+    pay_btn.click()
+    log("✅ 'Pay' 按钮已点击。")
+
+    time.sleep(5)
+    page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+    handle_cloudflare(page)
+    close_cookie_consent(page)  # 最后清理一次
+    return True
 
 def process_account(email, password, cookie_value, browser):
     """处理单个账号的续期，返回 (status, old_due, new_due)"""
@@ -314,6 +362,9 @@ def process_account(email, password, cookie_value, browser):
         if not login(page, email, password, cookie_value):
             log(f"❌ 账号 {email} 登录失败，跳过续期")
             return ("登录失败", "未知", "未知")
+
+        # 登录成功后关闭可能出现的 Cookie 弹窗
+        close_cookie_consent(page)
 
         # 获取 Server ID
         server_id = get_server_id(page)
