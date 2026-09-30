@@ -144,7 +144,6 @@ def wait_out_cf_challenge(page, max_wait=40):
 
 
 def try_solve_turnstile(page, max_wait=30):
-    """等待 Turnstile token 生成（camoufox 通常能自动通过）"""
     log(f"🔒 等待 Turnstile token（最多 {max_wait} 秒）...")
     start = time.time()
     last_check = 0
@@ -164,57 +163,94 @@ def try_solve_turnstile(page, max_wait=30):
     return tl > 0
 
 
-def login(page, email, password, cookie_value):
-    if cookie_value:
-        log("📇 尝试 Cookie 登录...")
-        try:
-            page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': cookie_value,
-                'domain': 'dash.hidencloud.com',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            wait_out_cf_challenge(page, max_wait=40)
-            log(f"📝 当前Title: {page.title()}")
-            if "auth/login" not in page.url and not is_cf_challenge_page(page):
-                log("✅ Cookie 登录成功！")
-                return True
-            log("❌ Cookie 失效或被 CF 拦")
-        except Exception as e:
-            log(f"⚠️ Cookie 登录异常: {e}")
-
-    if not email or not password:
-        return False
-
-    log("💣 尝试账号密码登录...")
+def login_with_password(page, email, password):
+    """用账号密码登录（让 camoufox 自己管理 session）"""
+    log("💣 使用账号密码登录（推荐，session 更可靠）...")
     try:
         try:
             page.context.clear_cookies()
         except Exception:
             pass
+
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         wait_out_cf_challenge(page, max_wait=40)
+        time.sleep(2)
+
         page.fill('input[name="email"]', email)
         page.fill('input[name="password"]', password)
         time.sleep(0.5)
-        page.click('button[type="submit"]')
+
+        # 点击登录
+        try:
+            page.click('button[type="submit"]', timeout=5000)
+        except Exception:
+            try:
+                page.click('button:has-text("Login")', timeout=5000)
+            except Exception:
+                page.click('button:has-text("Sign in")', timeout=5000)
+
         time.sleep(3)
         wait_out_cf_challenge(page, max_wait=40)
         page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
         wait_out_cf_challenge(page, max_wait=40)
+
+        log(f"📝 登录后Title: {page.title()}, URL: {page.url}")
         if "auth/login" in page.url or is_cf_challenge_page(page):
+            log("❌ 密码登录失败")
             return False
-        log("✅ 账号密码登录成功！")
+        log("✅ 密码登录成功！")
         return True
     except Exception as e:
-        log(f"❌ 登录异常: {e}")
+        log(f"❌ 密码登录异常: {e}")
         return False
+
+
+def login_with_cookie(page, cookie_value):
+    """用预置 cookie 登录（Firefox 兼容格式）"""
+    log("📇 尝试 Cookie 登录（Firefox 兼容格式）...")
+    try:
+        # Firefox 要求：
+        #  - sameSite 小写 ('lax'/'strict'/'none')
+        #  - domain 带前缀点 ('.dash.hidencloud.com')
+        #  - expires 为 Unix 秒
+        page.context.add_cookies([{
+            'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
+            'value': cookie_value,
+            'domain': '.dash.hidencloud.com',
+            'path': '/',
+            'expires': int(time.time()) + 3600 * 24 * 365,
+            'httpOnly': True,
+            'secure': True,
+            'sameSite': 'Lax',
+        }])
+
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        wait_out_cf_challenge(page, max_wait=40)
+        time.sleep(2)
+        log(f"📝 当前Title: {page.title()}, URL: {page.url}")
+        if "auth/login" not in page.url and not is_cf_challenge_page(page):
+            log("✅ Cookie 登录成功！")
+            return True
+        log("❌ Cookie 失效或被 CF 拦")
+        return False
+    except Exception as e:
+        log(f"⚠️ Cookie 登录异常: {e}")
+        return False
+
+
+def login(page, email, password, cookie_value):
+    """优先密码登录，失败再用 cookie"""
+    if email and password:
+        if login_with_password(page, email, password):
+            return True
+        log("⚠️ 密码登录失败，尝试 Cookie...")
+
+    if cookie_value:
+        if login_with_cookie(page, cookie_value):
+            return True
+
+    return False
 
 
 def get_server_id(page):
@@ -312,6 +348,11 @@ def click_create_invoice_with_retry(page, create_btn):
         for i in range(WAIT_AFTER_CLICK * 2):
             time.sleep(0.5)
             if state["posted"]:
+                # 检查 302 目标是否是登录页
+                loc = state.get("location", "")
+                if "auth/login" in loc:
+                    log(f"❌ POST /renew 302 到登录页，session 已失效！")
+                    return False, state["status"], loc
                 log(f"✅ 第 {attempt} 次点击（{method_name}）成功触发 POST /renew")
                 return True, state["status"], state["location"]
 
@@ -551,7 +592,6 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # camoufox 下 CF 通常自动过，这里等待 token
     try_solve_turnstile(page, max_wait=30)
 
     try:
@@ -564,7 +604,7 @@ def click_renew_and_create(page, service_url, attempt=1):
 
     posted, status, location = click_create_invoice_with_retry(page, create_btn)
     if not posted:
-        log("⚠️ 未能触发 POST /renew")
+        log("⚠️ 未能触发 POST /renew 或 session 失效")
         return False
 
     log(f"✅ Create Invoice POST 已触发（{status}），Location: {location}")
@@ -741,7 +781,6 @@ def main():
             log(f"⚠️ 第 {idx+1} 个账号缺少凭证，跳过")
             continue
 
-        # camoufox 参数
         camoufox_kwargs = {
             "headless": False,
             "humanize": True,
@@ -750,7 +789,6 @@ def main():
         }
         if IS_PROXY:
             camoufox_kwargs["proxy"] = {"server": PROXY_SERVER}
-            camoufox_kwargs["geoip"] = True
 
         log(f"🚀 启动 camoufox（账号 {idx+1}/{total}）...")
         try:
