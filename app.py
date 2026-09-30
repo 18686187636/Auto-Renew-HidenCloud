@@ -22,15 +22,24 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF = 5
-CF_TURNSTILE_TIMEOUT  = 45   # 增加到 45 秒，给 Turnstile 更多时间
+CF_TURNSTILE_TIMEOUT  = 45
 NAV_POLL_SECONDS      = 30
 WAIT_AFTER_PAY        = 15
+PAGE_LOAD_TIMEOUT     = 60000
 
 TURNSTILE_IFRAME_SEL = (
     'iframe[src*="challenges.cloudflare.com"], '
     'iframe[title*="cloudflare"], '
     'iframe[src*="turnstile"]'
 )
+
+RENEW_BTN_SELECTORS = [
+    'button:has-text("Renew")',
+    'a:has-text("Renew")',
+    'a[href*="renew"]',
+    ':is(button, a):has-text("Renew")',
+    'button[type="submit"]:has-text("Renew")',
+]
 
 
 def log(message):
@@ -50,15 +59,7 @@ def mask_email(email):
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 window.chrome = { runtime: {} };
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications' ?
-        Promise.resolve({ state: Notification.permission }) :
-        originalQuery(parameters)
-);
 """
 
 
@@ -100,6 +101,19 @@ def send_telegram_notification(status, old_due, new_due, email):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
+
+def save_debug(page, name):
+    """保存截图 + HTML，用于诊断"""
+    try:
+        page.screenshot(path=f"{name}.png", full_page=True)
+    except Exception:
+        pass
+    try:
+        with open(f"{name}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except Exception:
+        pass
 
 
 def mouse_click_element(page, locator, label=""):
@@ -147,7 +161,6 @@ def handle_cloudflare(page):
 
 
 def _get_turnstile_token(page):
-    """检查 cf-turnstile-response 隐藏 input 是否已被填充"""
     try:
         val = page.evaluate(
             "() => { const el = document.querySelector('input[name=\"cf-turnstile-response\"]'); return el ? el.value : ''; }"
@@ -158,66 +171,45 @@ def _get_turnstile_token(page):
 
 
 def solve_turnstile_checkbox(page, timeout=45):
-    """
-    三重策略处理 Cloudflare Turnstile：
-      A. 遍历 page.frames，直接在 CF frame 内部点击 checkbox / body
-      B. frame_locator + position 在 iframe 内部坐标点击
-      C. 外层 page 鼠标坐标点击 + down/up 模拟人类行为
-    每次点击后都检查 cf-turnstile-response token 是否已填充。
-    """
     log(f"🔒 开始处理 Turnstile (超时 {timeout}s)")
     start = time.time()
     attempt = 0
 
     while time.time() - start < timeout:
         attempt += 1
-
-        # 1. 检查 token 是否已填充
         token = _get_turnstile_token(page)
         if token and len(token) > 10:
             log(f"✅ Turnstile token 已填充 (len={len(token)}, attempt={attempt})")
             return True
 
-        # 2. 每次循环都尝试关闭 Cookie 横幅
         close_cookie_consent(page)
 
         iframe_count = page.locator(TURNSTILE_IFRAME_SEL).count()
         if iframe_count == 0:
-            # iframe 已消失，再确认一次 token
             time.sleep(1)
             token = _get_turnstile_token(page)
             if token and len(token) > 10:
-                log(f"✅ Turnstile 已通过（iframe 消失）")
+                log("✅ Turnstile 已通过（iframe 消失）")
                 return True
             time.sleep(1)
             continue
 
         log(f"🔍 attempt={attempt}: 检测到 {iframe_count} 个 CF iframe")
 
-        # ===== 策略 A：直接操作 frame 对象 =====
+        # 策略 A：直接操作 frame 对象
         try:
             for frame in page.frames:
                 furl = frame.url or ""
                 if "challenges.cloudflare.com" in furl:
-                    # A1：尝试内部 checkbox 元素
-                    try:
-                        cb = frame.locator('input[type="checkbox"]').first
-                        if cb.count() > 0:
-                            cb.click(timeout=2000, force=True)
-                            log("  ✅ A1: frame 内部 checkbox 点击")
-                            time.sleep(2)
-                    except Exception as e:
-                        log(f"  A1 失败: {e}")
-                    # A2：尝试内部 [role=checkbox]
-                    try:
-                        rcb = frame.locator('[role="checkbox"]').first
-                        if rcb.count() > 0:
-                            rcb.click(timeout=2000, force=True)
-                            log("  ✅ A2: frame 内部 role=checkbox 点击")
-                            time.sleep(2)
-                    except Exception:
-                        pass
-                    # A3：直接点击 frame body 的 checkbox 区域
+                    for sel in ['input[type="checkbox"]', '[role="checkbox"]']:
+                        try:
+                            cb = frame.locator(sel).first
+                            if cb.count() > 0:
+                                cb.click(timeout=2000, force=True)
+                                log(f"  ✅ A: frame 内部 {sel} 点击")
+                                time.sleep(2)
+                        except Exception:
+                            pass
                     try:
                         frame.locator('body').click(
                             position={"x": 30, "y": 32},
@@ -225,23 +217,23 @@ def solve_turnstile_checkbox(page, timeout=45):
                         )
                         log("  ✅ A3: frame body 坐标点击")
                         time.sleep(2)
-                    except Exception as e:
-                        log(f"  A3 失败: {e}")
+                    except Exception:
+                        pass
         except Exception as e:
             log(f"  策略A 异常: {e}")
 
-        # A 策略点击后检查 token
         token = _get_turnstile_token(page)
         if token and len(token) > 10:
             log(f"✅ Turnstile token 已填充 (len={len(token)})")
             return True
 
-        # ===== 策略 B：frame_locator + position =====
+        # 策略 B：frame_locator + position
         try:
             fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first
             try:
-                body = fl.locator('body').first
-                body.click(position={"x": 30, "y": 32}, timeout=3000, force=True)
+                fl.locator('body').first.click(
+                    position={"x": 30, "y": 32}, timeout=3000, force=True
+                )
                 log("  ✅ B: frame_locator body 坐标点击")
             except Exception as e:
                 log(f"  B 失败: {e}")
@@ -249,37 +241,29 @@ def solve_turnstile_checkbox(page, timeout=45):
             log(f"  策略B 异常: {e}")
 
         time.sleep(2)
-
         token = _get_turnstile_token(page)
         if token and len(token) > 10:
             log(f"✅ Turnstile token 已填充 (len={len(token)})")
             return True
 
-        # ===== 策略 C：外层鼠标坐标点击 =====
+        # 策略 C：外层鼠标坐标点击
         try:
             box = page.locator(TURNSTILE_IFRAME_SEL).first.bounding_box()
             if box:
-                # 尝试 2 个不同的水平位置
                 for ratio in (0.05, 0.09):
                     x = box["x"] + box["width"] * ratio
                     y = box["y"] + box["height"] / 2
                     log(f"  🖱️ C: 物理点击 ({x:.0f}, {y:.0f})")
-                    # 模拟人类移动
-                    page.mouse.move(
-                        x - random.uniform(70, 110),
-                        y - random.uniform(30, 55)
-                    )
+                    page.mouse.move(x - random.uniform(70, 110),
+                                    y - random.uniform(30, 55))
                     time.sleep(random.uniform(0.25, 0.45))
-                    page.mouse.move(
-                        x + random.uniform(-3, 3),
-                        y + random.uniform(-3, 3)
-                    )
+                    page.mouse.move(x + random.uniform(-3, 3),
+                                    y + random.uniform(-3, 3))
                     time.sleep(random.uniform(0.1, 0.25))
                     page.mouse.down()
                     time.sleep(random.uniform(0.05, 0.14))
                     page.mouse.up()
                     time.sleep(2)
-
                     token = _get_turnstile_token(page)
                     if token and len(token) > 10:
                         log(f"✅ Turnstile token 已填充 (len={len(token)})")
@@ -294,7 +278,6 @@ def solve_turnstile_checkbox(page, timeout=45):
 
 
 def close_cookie_consent(page):
-    """强化 Cookie 横幅关闭逻辑"""
     try:
         if page.locator('.fc-consent-root').count() == 0:
             return
@@ -324,6 +307,23 @@ def close_cookie_consent(page):
         pass
 
 
+def goto_and_settle(page, url, timeout=PAGE_LOAD_TIMEOUT):
+    """goto 后等 networkidle，再触发 CF 处理"""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    except Exception as e:
+        log(f"⚠️ goto {url} 失败: {e}")
+        return False
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    handle_cloudflare(page)
+    close_cookie_consent(page)
+    time.sleep(1)
+    return True
+
+
 def login(page, email, password, cookie_value):
     if cookie_value:
         log("📇 尝试 Cookie 登录...")
@@ -338,7 +338,7 @@ def login(page, email, password, cookie_value):
                 'secure': True,
                 'sameSite': 'Lax'
             }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             handle_cloudflare(page)
             log(f"📝 当前Title: {page.title()}")
             if "auth/login" not in page.url:
@@ -357,7 +357,7 @@ def login(page, email, password, cookie_value):
             page.context.clear_cookies()
         except Exception:
             pass
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         handle_cloudflare(page)
         page.fill('input[name="email"]', email)
         page.fill('input[name="password"]', password)
@@ -367,7 +367,7 @@ def login(page, email, password, cookie_value):
         time.sleep(3)
         handle_cloudflare(page)
         page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
-        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         handle_cloudflare(page)
         if "auth/login" in page.url:
             return False
@@ -394,36 +394,64 @@ def get_server_id(page):
         return None
 
 
-def get_due_date(page, service_url):
-    try:
-        if service_url not in page.url:
-            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        close_cookie_consent(page)
-        body_text = page.locator("body").inner_text()
-        patterns = [
-            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
+DATE_PATTERN = re.compile(
+    r"Due date\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}|\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def get_due_date(page, service_url, retries=2):
+    """
+    打开服务页，等待 'Due date' 出现。
+    若失败会 reload 重试，最后保存 debug 文件。
+    """
+    for attempt in range(retries + 1):
+        try:
+            if attempt > 0:
+                log(f"🔄 第 {attempt+1} 次尝试获取 Due Date")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                except Exception:
+                    pass
+            else:
+                if service_url not in page.url:
+                    goto_and_settle(page, service_url)
+                else:
+                    handle_cloudflare(page)
+                    close_cookie_consent(page)
+
+            # 等待 "Due date" 或 "Renew" 出现（最多 20s）
+            for _ in range(20):
+                try:
+                    body_text = page.locator("body").inner_text()
+                except Exception:
+                    body_text = ""
+                if "Due date" in body_text or "Renew" in body_text:
+                    break
+                time.sleep(1)
+
+            # 尝试匹配日期
+            m = DATE_PATTERN.search(body_text)
             if m:
                 due = m.group(1).strip()
                 log(f"📅 获取到Due Date: {due}")
                 return due
-        date_hits = re.findall(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}", body_text)
-        log(f"🔍 页面中所有日期样式文本: {date_hits[:10]}")
-    except Exception as e:
-        log(f"❌ 获取Due Date失败: {e}")
+
+            # 兜底：仅抓日期格式
+            hits = re.findall(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}", body_text)
+            log(f"🔍 第 {attempt+1} 次：页面日期样式文本 {hits[:8]}，页面长度 {len(body_text)}")
+        except Exception as e:
+            log(f"❌ 获取Due Date 第 {attempt+1} 次失败: {e}")
+
+    log("⚠️ Due Date 多次尝试后仍未获取，保存 debug 快照")
+    save_debug(page, "service_page_due_fail")
     return "未知"
 
 
 def get_unpaid_invoice_urls(page):
     log(f"🔍 访问未付发票列表: {UNPAID_INVOICES_URL}")
     try:
-        page.goto(UNPAID_INVOICES_URL, wait_until="domcontentloaded", timeout=60000)
+        page.goto(UNPAID_INVOICES_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
     except Exception as e:
         log(f"⚠️ 导航未付发票页失败: {e}")
         return []
@@ -433,13 +461,7 @@ def get_unpaid_invoice_urls(page):
     time.sleep(3)
 
     log(f"📝 未付发票页 Title: {page.title()}, URL: {page.url}")
-    try:
-        page.screenshot(path="unpaid_invoices.png", full_page=True)
-        with open("unpaid_invoices.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log("📸 已保存未付发票页")
-    except Exception:
-        pass
+    save_debug(page, "unpaid_invoices")
 
     urls = []
     try:
@@ -493,7 +515,7 @@ def try_pay_invoice(page, invoice_url):
     log(f"🔗 访问: {invoice_url}")
     try:
         if page.url != invoice_url:
-            page.goto(invoice_url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(invoice_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
     except Exception as e:
         log(f"⚠️ 导航失败: {e}")
         return False
@@ -502,31 +524,15 @@ def try_pay_invoice(page, invoice_url):
     close_cookie_consent(page)
     time.sleep(2)
 
-    title = page.title()
-    log(f"📝 页面 Title: {title}, URL: {page.url}")
-
-    # 跳转到发票页后立即截图
-    try:
-        page.screenshot(path="invoice_redirected.png", full_page=True)
-        with open("invoice_redirected.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log("📸 已保存：跳转后的发票页截图")
-    except Exception as e:
-        log(f"⚠️ 跳转后的发票页截图失败: {e}")
+    log(f"📝 页面 Title: {page.title()}, URL: {page.url}")
+    save_debug(page, "invoice_redirected")
 
     if not has_real_pay_button(page):
         log("⚠️ 该页没有真 Pay 按钮，跳过")
         return False
 
     log("✅ 该页有真 Pay 按钮，准备点击")
-
-    try:
-        page.screenshot(path="invoice_page.png", full_page=True)
-        with open("invoice_page.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log("📸 已保存发票页")
-    except Exception:
-        pass
+    save_debug(page, "invoice_page")
 
     selectors = [
         'form[action*="/payment/invoice/"][action$="/pay"] button[type="submit"]',
@@ -561,13 +567,7 @@ def try_pay_invoice(page, invoice_url):
                     log(f"⏳ 已点击 Pay，等待 {WAIT_AFTER_PAY} 秒...")
                     time.sleep(WAIT_AFTER_PAY)
 
-                    try:
-                        page.screenshot(path="after_pay.png", full_page=True)
-                        with open("after_pay.html", "w", encoding="utf-8") as f:
-                            f.write(page.content())
-                    except Exception:
-                        pass
-
+                    save_debug(page, "after_pay")
                     log(f"🔍 Pay 后 URL: {page.url}")
                     try:
                         body_text = page.locator("body").inner_text().lower()
@@ -585,17 +585,66 @@ def try_pay_invoice(page, invoice_url):
     return None
 
 
+def find_renew_button(page, timeout=30):
+    """
+    尝试多个选择器定位 Renew 按钮/链接，返回 (locator, selector) 或 (None, None)
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for sel in RENEW_BTN_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                cnt = loc.count()
+                if cnt == 0:
+                    continue
+                for i in range(cnt):
+                    el = loc.nth(i)
+                    try:
+                        if el.is_visible():
+                            return el, sel
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        time.sleep(1)
+    return None, None
+
+
 def renew_service(page, service_url):
     log("➡ 进入续期流程...")
     close_cookie_consent(page)
 
-    if page.url != service_url:
-        page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-    close_cookie_consent(page)
-    handle_cloudflare(page)
+    # 确保在服务页
+    if service_url not in page.url:
+        log(f"🔄 重新导航到服务页: {service_url}")
+        goto_and_settle(page, service_url)
+    else:
+        handle_cloudflare(page)
+        close_cookie_consent(page)
 
+    # 先等待 "Renew" 文本出现在 DOM（最多 30s）
     log("🖱️ 准备点击 'Renew'...")
-    renew_btn = page.locator('button:has-text("Renew")').first
+    renew_btn, used_sel = find_renew_button(page, timeout=30)
+
+    if renew_btn is None:
+        log("⚠️ 未找到 Renew 按钮，尝试 reload 一次")
+        save_debug(page, "renew_not_found")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            handle_cloudflare(page)
+            close_cookie_consent(page)
+            time.sleep(3)
+        except Exception:
+            pass
+        renew_btn, used_sel = find_renew_button(page, timeout=20)
+
+    if renew_btn is None:
+        log("❌ reload 后仍未找到 Renew 按钮")
+        save_debug(page, "renew_not_found_after_reload")
+        return False
+
+    log(f"✅ 找到 Renew 按钮，使用选择器: {used_sel}")
+
     create_btn = page.locator('button[type="submit"]:has-text("Create Invoice")').first
     if create_btn.count() == 0:
         create_btn = page.locator('button:has-text("Create Invoice")').first
@@ -603,11 +652,18 @@ def renew_service(page, service_url):
     modal_opened = False
     for i in range(3):
         try:
-            renew_btn.wait_for(state="visible", timeout=10000)
             renew_btn.scroll_into_view_if_needed()
             log(f"🖱️ 第 {i+1} 次点击 'Renew'...")
             close_cookie_consent(page)
-            renew_btn.click()
+            try:
+                renew_btn.click(timeout=8000)
+            except Exception:
+                # 若失效，重新查找
+                renew_btn, used_sel = find_renew_button(page, timeout=10)
+                if renew_btn is None:
+                    log("❌ 重试时未找到 Renew 按钮")
+                    break
+                renew_btn.click(timeout=8000)
 
             time.sleep(2)
             body_lower = page.locator("body").inner_text().lower()
@@ -630,6 +686,7 @@ def renew_service(page, service_url):
 
     if not modal_opened:
         log("❌ 弹窗未出现")
+        save_debug(page, "modal_not_opened")
         return False
 
     handle_cloudflare(page)
@@ -638,24 +695,15 @@ def renew_service(page, service_url):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # 关闭 Cookie 横幅（可能会在弹窗出现后再次渲染）
     close_cookie_consent(page)
     time.sleep(0.5)
 
-    try:
-        page.screenshot(path="before_create_invoice.png", full_page=True)
-        with open("before_create_invoice.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-    except Exception:
-        pass
+    save_debug(page, "before_create_invoice")
 
     log("🔒 处理 CF Turnstile...")
     if not solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
         log("❌ CF Turnstile 验证失败，无法创建发票")
-        try:
-            page.screenshot(path="cf_failed.png", full_page=True)
-        except Exception:
-            pass
+        save_debug(page, "cf_failed")
         return False
 
     log(f"🔍 点击 Create Invoice 前 URL: {page.url}")
@@ -676,31 +724,22 @@ def renew_service(page, service_url):
                 log(f"❌ 点击 Create Invoice 失败: {e}")
                 return False
 
-    # 点击 Create Invoice 后立即截图
     try:
         time.sleep(1)
-        page.screenshot(path="after_create_invoice_click_immediate.png", full_page=True)
-        with open("after_create_invoice_click_immediate.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log("📸 已保存：点击 Create Invoice 后立即截图")
-    except Exception as e:
-        log(f"⚠️ 点击 Create Invoice 后立即截图失败: {e}")
+        save_debug(page, "after_create_invoice_click_immediate")
+    except Exception:
+        pass
 
-    # 检查是否出现 CF 错误
     time.sleep(3)
     try:
         body_text = page.locator("body").inner_text()
         if "cf-turnstile-response" in body_text or "field is required" in body_text:
-            log("❌ 检测到错误：cf-turnstile-response field is required，CF 验证未通过或未提交")
-            try:
-                page.screenshot(path="cf_error_after_click.png", full_page=True)
-            except Exception:
-                pass
+            log("❌ 检测到错误：cf-turnstile-response field is required")
+            save_debug(page, "cf_error_after_click")
             return False
     except Exception:
         pass
 
-    # 短轮询
     log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
     auto_url = None
     for i in range(NAV_POLL_SECONDS):
@@ -719,14 +758,7 @@ def renew_service(page, service_url):
             break
         time.sleep(1)
 
-    # 跳转后截图
-    try:
-        page.screenshot(path="after_create_invoice_redirect.png", full_page=True)
-        with open("after_create_invoice_redirect.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log(f"📸 已保存：跳转后截图，当前 URL={page.url}")
-    except Exception as e:
-        log(f"⚠️ 跳转后截图失败: {e}")
+    save_debug(page, "after_create_invoice_redirect")
 
     # === 支付处理 ===
     paid_ok = False
@@ -767,7 +799,7 @@ def renew_service(page, service_url):
     log("🔍 返回服务页确认状态...")
     time.sleep(3)
     try:
-        page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+        page.goto(service_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         handle_cloudflare(page)
         close_cookie_consent(page)
     except Exception as e:
@@ -782,8 +814,6 @@ def process_account(identifier, email, password, cookie_value, browser):
         viewport={'width': 1920, 'height': 1080},
         user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         proxy={"server": PROXY_SERVER} if IS_PROXY else None,
-        locale='en-US',
-        timezone_id='Europe/Berlin',
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
