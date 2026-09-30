@@ -41,6 +41,12 @@ RENEW_BTN_SELECTORS = [
     'button[type="submit"]:has-text("Renew")',
 ]
 
+# 与运行环境一致的 Linux UA（之前 5m 13s 日志里正常加载时用的就是这个）
+DEFAULT_UA = (
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+)
+
 
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
@@ -57,12 +63,8 @@ def mask_email(email):
     return email[:2] + '****'
 
 
-# ========== 增强版 stealth 脚本 ==========
 STEALTH_JS = r"""
-// 1. webdriver
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-// 2. chrome 对象完整模拟
 window.chrome = window.chrome || {};
 window.chrome.runtime = window.chrome.runtime || {};
 window.chrome.app = {
@@ -75,24 +77,18 @@ window.chrome.app = {
 window.chrome.csi = function () { return {}; };
 window.chrome.loadTimes = function () { return {}; };
 
-// 3. 语言、插件
 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 Object.defineProperty(navigator, 'plugins', {
   get: () => [
     { name: 'PDF Viewer', filename: 'internal-pdf-viewer' },
     { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer' },
     { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer' },
-    { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer' },
-    { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer' },
   ],
 });
-
-// 4. 硬件指纹
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
 Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
 
-// 5. 权限 API
 const origQuery = window.navigator.permissions && window.navigator.permissions.query;
 if (origQuery) {
   window.navigator.permissions.query = (parameters) => (
@@ -102,40 +98,26 @@ if (origQuery) {
   );
 }
 
-// 6. WebGL 指纹伪装
 const getParameterProto = WebGLRenderingContext.prototype.getParameter;
 WebGLRenderingContext.prototype.getParameter = function (parameter) {
-  if (parameter === 37445) return 'Intel Inc.';                       // UNMASKED_VENDOR_WEBGL
-  if (parameter === 37446) return 'Intel Iris OpenGL Engine';         // UNMASKED_RENDERER_WEBGL
+  if (parameter === 37445) return 'Intel Inc.';
+  if (parameter === 37446) return 'Intel Iris OpenGL Engine';
   return getParameterProto.call(this, parameter);
 };
-const getParameterProto2 = WebGL2RenderingContext && WebGL2RenderingContext.prototype.getParameter;
-if (getParameterProto2) {
+if (window.WebGL2RenderingContext) {
+  const g2 = WebGL2RenderingContext.prototype.getParameter;
   WebGL2RenderingContext.prototype.getParameter = function (parameter) {
     if (parameter === 37445) return 'Intel Inc.';
     if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-    return getParameterProto2.call(this, parameter);
+    return g2.call(this, parameter);
   };
 }
 
-// 7. Notification.permission 与 permissions.query 一致
 if (typeof Notification !== 'undefined') {
   Object.defineProperty(Notification, 'permission', { get: () => 'default' });
 }
 
-// 8. 隐藏 CDP 痕迹
 ['__playwright', '__pw_manual', '__PW_inspect'].forEach(k => { try { delete window[k]; } catch (e) {} });
-
-// 9. iframe contentWindow 上隐藏 webdriver
-try {
-  Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-    get() {
-      const win = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow').get.call(this);
-      try { Object.defineProperty(win.navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
-      return win;
-    }
-  });
-} catch (e) {}
 """
 
 
@@ -191,8 +173,28 @@ def save_debug(page, name):
         pass
 
 
+def log_page_state(page, tag=""):
+    """打印当前页面的关键诊断信息"""
+    try:
+        url = page.url
+    except Exception:
+        url = "?"
+    try:
+        title = page.title()
+    except Exception:
+        title = "?"
+    try:
+        body_text = page.locator("body").inner_text()
+    except Exception as e:
+        body_text = f"<inner_text failed: {e}>"
+    preview = body_text[:300].replace("\n", "\\n")
+    log(f"🔎 [{tag}] URL={url}")
+    log(f"🔎 [{tag}] Title={title!r}, body_len={len(body_text)}")
+    log(f"🔎 [{tag}] body_preview={preview!r}")
+    return body_text
+
+
 def human_mouse_warmup(page):
-    """在页面中心做几次随机移动，模拟人类使用浏览器"""
     try:
         vp = page.viewport_size or {"width": 1280, "height": 720}
         w, h = vp["width"], vp["height"]
@@ -206,17 +208,12 @@ def human_mouse_warmup(page):
 
 
 def human_click_at(page, x, y):
-    """慢速移动 + 停顿 + 点击"""
     try:
         vp = page.viewport_size or {"width": 1280, "height": 720}
-        # 从随机起点靠近目标
-        sx = x - random.uniform(60, 140)
-        sy = y - random.uniform(20, 60)
-        sx = max(0, min(sx, vp["width"]))
-        sy = max(0, min(sy, vp["height"]))
+        sx = max(0, min(x - random.uniform(60, 140), vp["width"]))
+        sy = max(0, min(y - random.uniform(20, 60), vp["height"]))
         page.mouse.move(sx, sy, steps=random.randint(6, 12))
         time.sleep(random.uniform(0.15, 0.35))
-        # 分两段到达目标，中间停顿
         mid_x = (sx + x) / 2 + random.uniform(-6, 6)
         mid_y = (sy + y) / 2 + random.uniform(-6, 6)
         page.mouse.move(mid_x, mid_y, steps=random.randint(4, 8))
@@ -266,25 +263,19 @@ def handle_cloudflare(page):
     return False
 
 
-# ========== Token 抓取：覆盖多种可能 ==========
 def _get_turnstile_token(page):
-    """从多个位置尝试抓取 Turnstile token"""
     try:
         val = page.evaluate(r"""
         () => {
-          // 1) 标准 input
           const inp = document.querySelector('input[name="cf-turnstile-response"]');
           if (inp && inp.value && inp.value.length > 10) return inp.value;
-          // 2) textarea
           const ta = document.querySelector('textarea[name="cf-turnstile-response"]');
           if (ta && ta.value && ta.value.length > 10) return ta.value;
-          // 3) 任意 data-response
           const el = document.querySelector('[data-response]');
           if (el) {
             const v = el.getAttribute('data-response');
             if (v && v.length > 10) return v;
           }
-          // 4) 任意 input 名字含 turnstile
           const all = document.querySelectorAll('input, textarea');
           for (const e of all) {
             if (e.name && e.name.toLowerCase().includes('turnstile')) {
@@ -322,24 +313,13 @@ def _dump_turnstile_debug(page, tag):
     try:
         cnt = page.locator(TURNSTILE_IFRAME_SEL).count()
         log(f"    [debug-{tag}] iframe 数量: {cnt}")
-        for i in range(cnt):
-            try:
-                box = page.locator(TURNSTILE_IFRAME_SEL).nth(i).bounding_box()
-                log(f"    [debug-{tag}] iframe[{i}] box={box}")
-            except Exception:
-                pass
     except Exception:
         pass
     save_debug(page, f"cf_fail_{tag}")
 
 
 def solve_turnstile_checkbox(page, timeout=90):
-    """
-    慢速人类交互 + 三重策略 + 多点位 + 耐心等待。
-    """
     log(f"🔒 开始处理 Turnstile (超时 {timeout}s)")
-
-    # 先做一次人类鼠标预热
     human_mouse_warmup(page)
     time.sleep(1)
 
@@ -358,18 +338,16 @@ def solve_turnstile_checkbox(page, timeout=90):
 
         iframe_count = page.locator(TURNSTILE_IFRAME_SEL).count()
         if iframe_count == 0:
-            # iframe 消失后多等几秒，让 token 写入
             for _ in range(5):
                 time.sleep(1)
                 token = _get_turnstile_token(page)
                 if token and len(token) > 10:
-                    log(f"✅ Turnstile token 已填充 (iframe 消失后)")
+                    log("✅ Turnstile token 已填充 (iframe 消失后)")
                     return True
             continue
 
         log(f"🔍 attempt={attempt}: 检测到 {iframe_count} 个 CF iframe")
 
-        # ===== 1) frame_locator 内部点击 =====
         try:
             fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first
             for coord in coords_list:
@@ -381,7 +359,6 @@ def solve_turnstile_checkbox(page, timeout=90):
                     log(f"  ✅ 策略1 frame_locator {coord}")
                 except Exception:
                     pass
-                # 每次点击后等 2.5 秒，让 CF 有反应
                 time.sleep(2.5)
                 token = _get_turnstile_token(page)
                 if token and len(token) > 10:
@@ -390,7 +367,6 @@ def solve_turnstile_checkbox(page, timeout=90):
         except Exception as e:
             log(f"  策略1 异常: {e}")
 
-        # ===== 2) frame 内部 DOM 点击 =====
         try:
             for frame in page.frames:
                 furl = frame.url or ""
@@ -427,7 +403,6 @@ def solve_turnstile_checkbox(page, timeout=90):
         except Exception as e:
             log(f"  策略2 异常: {e}")
 
-        # ===== 3) 外层鼠标：人类曲线移动 =====
         try:
             box = page.locator(TURNSTILE_IFRAME_SEL).first.bounding_box()
             if box:
@@ -488,7 +463,7 @@ def goto_and_settle(page, url, timeout=PAGE_LOAD_TIMEOUT):
         log(f"⚠️ goto {url} 失败: {e}")
         return False
     try:
-        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
     handle_cloudflare(page)
@@ -572,31 +547,59 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
+CF_CHALLENGE_HINTS = ("just a moment", "checking your browser",
+                      "cf-browser-verification", "enable javascript and cookies",
+                      "attention required")
 
-def get_due_date(page, service_url, retries=2):
-    for attempt in range(retries + 1):
+
+def _looks_like_cf_challenge(body_text):
+    low = body_text.lower()
+    return any(k in low for k in CF_CHALLENGE_HINTS)
+
+
+def get_due_date(page, service_url, retries=3):
+    """
+    打开 service 页，等待真正渲染出 Due date / Renew。
+    若页面过短或疑似 CF 挑战，则等待更久后重试。
+    """
+    for attempt in range(retries):
         try:
-            if attempt > 0:
-                log(f"🔄 第 {attempt+1} 次尝试获取 Due Date")
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-                except Exception:
-                    pass
-            else:
+            if attempt == 0:
                 if service_url not in page.url:
                     goto_and_settle(page, service_url)
                 else:
                     handle_cloudflare(page)
                     close_cookie_consent(page)
+            else:
+                log(f"🔄 第 {attempt+1} 次尝试获取 Due Date")
+                try:
+                    page.goto(service_url, wait_until="domcontentloaded",
+                              timeout=PAGE_LOAD_TIMEOUT)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+                handle_cloudflare(page)
+                close_cookie_consent(page)
 
-            for _ in range(20):
+            # 轮询等待页面渲染
+            body_text = ""
+            for _ in range(30):  # 最多 30 秒
                 try:
                     body_text = page.locator("body").inner_text()
                 except Exception:
                     body_text = ""
-                if "Due date" in body_text or "Renew" in body_text:
+                if ("Due date" in body_text) or ("Renew" in body_text and len(body_text) > 2000):
                     break
+                # 若页面很短且疑似 CF 挑战，等一下再检查
+                if len(body_text) < 1000 and _looks_like_cf_challenge(body_text):
+                    time.sleep(2)
+                    continue
                 time.sleep(1)
+
+            log_page_state(page, f"due_attempt{attempt+1}")
 
             m = DATE_PATTERN.search(body_text)
             if m:
@@ -605,7 +608,12 @@ def get_due_date(page, service_url, retries=2):
                 return due
 
             hits = re.findall(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}", body_text)
-            log(f"🔍 第 {attempt+1} 次：日期样式文本 {hits[:8]}，页面长度 {len(body_text)}")
+            log(f"🔍 第 {attempt+1} 次：日期样式文本 {hits[:8]}，body_len={len(body_text)}")
+
+            if _looks_like_cf_challenge(body_text):
+                log(f"⚠️ 疑似 CF 挑战页，等待 8 秒后重试")
+                time.sleep(8)
+
         except Exception as e:
             log(f"❌ 获取Due Date 第 {attempt+1} 次失败: {e}")
 
@@ -774,7 +782,6 @@ def find_renew_button(page, timeout=30):
 
 
 def try_open_renew_modal(page, create_btn, service_url):
-    """尝试打开 Renew 弹窗，返回 True/False/'NOT_TIME'"""
     renew_btn, used_sel = find_renew_button(page, timeout=30)
     if renew_btn is None:
         log("⚠️ 未找到 Renew 按钮，尝试 reload 一次")
@@ -848,12 +855,15 @@ def renew_service(page, service_url):
     if create_btn.count() == 0:
         create_btn = page.locator('button:has-text("Create Invoice")').first
 
-    # 最多 2 轮尝试（Turnstile 失败时，关闭弹窗重开）
     for round_idx in range(2):
         if round_idx > 0:
             log(f"🔁 第 {round_idx+1} 轮：刷新服务页后重新打开 Renew 弹窗")
             try:
                 page.goto(service_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
                 handle_cloudflare(page)
                 close_cookie_consent(page)
                 time.sleep(3)
@@ -883,7 +893,6 @@ def renew_service(page, service_url):
         if not solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
             log(f"❌ 第 {round_idx+1} 轮 CF Turnstile 验证失败")
             save_debug(page, f"cf_failed_round{round_idx+1}")
-            # 关闭弹窗（按 Escape）后重试
             try:
                 page.keyboard.press("Escape")
                 time.sleep(1)
@@ -891,7 +900,6 @@ def renew_service(page, service_url):
                 pass
             continue
 
-        # Turnstile 通过，点击 Create Invoice
         log(f"🔍 点击 Create Invoice 前 URL: {page.url}")
         log("🖱️ 物理点击 'Create Invoice'...")
 
@@ -922,7 +930,6 @@ def renew_service(page, service_url):
             if "cf-turnstile-response" in body_text or "field is required" in body_text:
                 log("❌ 检测到错误：cf-turnstile-response field is required")
                 save_debug(page, "cf_error_after_click")
-                # 关闭弹窗重试
                 try:
                     page.keyboard.press("Escape")
                     time.sleep(1)
@@ -932,7 +939,6 @@ def renew_service(page, service_url):
         except Exception:
             pass
 
-        # 进入支付流程
         log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
         auto_url = None
         for i in range(NAV_POLL_SECONDS):
@@ -1007,13 +1013,11 @@ def process_account(identifier, email, password, cookie_value, browser):
     log(f"=== 开始处理账号: {mask_email(email) or identifier} ===")
     context = browser.new_context(
         viewport={'width': 1920, 'height': 1080},
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        user_agent=DEFAULT_UA,
         proxy={"server": PROXY_SERVER} if IS_PROXY else None,
         locale='en-US',
-        timezone_id='Europe/Berlin',
-        extra_http_headers={
-            'Accept-Language': 'en-US,en;q=0.9',
-        },
+        timezone_id='UTC',
+        extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
@@ -1092,7 +1096,8 @@ def main():
         browser = None
         try:
             log("🚀 启动浏览器...")
-            launch_kwargs = dict(
+            # 回退到默认 Chromium（之前 5m 13s 日志里能正常加载 service 页）
+            browser = p.chromium.launch(
                 headless=False,
                 args=[
                     '--no-sandbox',
@@ -1100,17 +1105,9 @@ def main():
                     '--disable-infobars',
                     '--disable-dev-shm-usage',
                     '--window-size=1920,1080',
-                    '--disable-features=IsolateOrigins,site-per-process',
                     '--lang=en-US',
                 ]
             )
-            # 优先使用真 Chrome channel（若已安装），否则用默认 Chromium
-            try:
-                browser = p.chromium.launch(channel="chrome", **launch_kwargs)
-                log("🌐 使用真实 Chrome channel")
-            except Exception as e:
-                log(f"⚠️ channel=chrome 启动失败，回退到默认 Chromium: {e}")
-                browser = p.chromium.launch(**launch_kwargs)
 
             all_success = True
             total = len(accounts)
