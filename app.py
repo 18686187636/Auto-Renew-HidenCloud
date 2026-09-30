@@ -22,10 +22,9 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF = 5
-CF_DETECT_WAIT        = 15   # 等 CF iframe 出现
-CF_TURNSTILE_TIMEOUT  = 30   # 点击 CF 后等结果
+CF_DETECT_WAIT        = 15
+CF_TURNSTILE_TIMEOUT  = 30
 NAV_POLL_SECONDS      = 20
-UNPAID_WAIT_SECONDS   = 40
 WAIT_AFTER_PAY        = 15
 
 
@@ -118,110 +117,127 @@ CF_IFRAME_SEL = (
 )
 
 
+def get_turnstile_token_len(page):
+    """
+    返回 Turnstile token 长度：
+      -1  → 页面没有 Turnstile input
+       0  → 有 Turnstile input，但 token 为空（未通过）
+      >0  → token 已生成（通过）
+    """
+    try:
+        return page.evaluate("""
+            () => {
+                const inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
+                if (inputs.length === 0) return -1;
+                let maxLen = 0;
+                inputs.forEach(i => { if (i.value && i.value.length > maxLen) maxLen = i.value.length; });
+                return maxLen;
+            }
+        """)
+    except Exception:
+        return -1
+
+
 def detect_cf_elements(page):
-    """返回 (iframe_count, has_turnstile_container)"""
+    """返回 (iframe_count, container_count, token_len)"""
     try:
         iframe_n = page.locator(CF_IFRAME_SEL).count()
     except Exception:
         iframe_n = 0
     try:
-        # Turnstile 容器
-        container_n = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').count()
+        container_n = page.locator('div.cf-turnstile, [data-sitekey]').count()
     except Exception:
         container_n = 0
-    return iframe_n, container_n
+    token_len = get_turnstile_token_len(page)
+    return iframe_n, container_n, token_len
 
 
 def solve_turnstile_checkbox(page):
     """
-    1. 先等 CF 元素出现（最多 CF_DETECT_WAIT 秒）
-    2. 出现后物理点击 iframe 左侧，等验证通过
-    3. 如果 CF_DETECT_WAIT 秒内完全没出现，视为自动通过
+    等 Turnstile input 出现 → 等 token 生成 → 未生成则点击 iframe
+    返回 True 表示 CF 通过（或页面无 CF），False 表示 CF 未通过
     """
-    log(f"🔍 等待 CF Turnstile 元素出现（最多 {CF_DETECT_WAIT} 秒）...")
+    log(f"🔍 等待 Turnstile input 出现（最多 {CF_DETECT_WAIT} 秒）...")
+
     start = time.time()
-    cf_seen = False
-    first_iframe_n = 0
+    token_len = -1
+    has_turnstile = False
 
     while time.time() - start < CF_DETECT_WAIT:
-        iframe_n, container_n = detect_cf_elements(page)
-        if first_iframe_n == 0 and iframe_n > 0:
-            first_iframe_n = iframe_n
-        if iframe_n > 0 or container_n > 0:
-            log(f"✅ 检测到 CF 元素: iframe={iframe_n}, container={container_n}")
-            cf_seen = True
+        token_len = get_turnstile_token_len(page)
+        if token_len >= 0:
+            log(f"✅ 检测到 Turnstile input，token 长度={token_len}")
+            has_turnstile = True
             break
         time.sleep(1)
 
-    if not cf_seen:
-        log(f"⚠️ {CF_DETECT_WAIT} 秒内未检测到任何 CF 元素，视为自动通过模式")
+    if not has_turnstile:
+        # 页面上没有 Turnstile input
+        iframe_n, container_n, _ = detect_cf_elements(page)
+        log(f"⚠️ {CF_DETECT_WAIT} 秒内未检测到 Turnstile input（iframe={iframe_n}, container={container_n}）")
+        log("   → 视为页面无 CF，跳过")
         return True
 
-    # 有 CF 元素 → 尝试物理点击 iframe 左侧
-    log("🔒 检测到 CF，尝试物理点击复选框位置...")
+    if token_len > 0:
+        log(f"✅ Turnstile token 已生成（长度 {token_len}）")
+        return True
+
+    # 有 input 但 token 为空 → 需要点击
+    log("🔒 Turnstile token 为空，等待/点击 iframe...")
     click_start = time.time()
+    attempt = 0
+
     while time.time() - click_start < CF_TURNSTILE_TIMEOUT:
-        iframe_n, _ = detect_cf_elements(page)
-        if iframe_n == 0:
-            log("✅ CF iframe 已消失，验证通过")
+        token_len = get_turnstile_token_len(page)
+        if token_len > 0:
+            log(f"✅ Turnstile token 已生成（长度 {token_len}）")
             return True
 
-        # 找 iframe
-        frames = page.locator(CF_IFRAME_SEL)
-        for i in range(frames.count()):
-            try:
-                box = frames.nth(i).bounding_box()
-                if not box:
-                    continue
-                # Turnstile checkbox 一般在左侧 20~40px 处
-                x = box["x"] + 30
-                y = box["y"] + box["height"] / 2
-                log(f"🖱️ 物理点击 CF iframe[{i}] ({x:.0f}, {y:.0f})")
-                page.mouse.move(x - random.uniform(60, 90), y - random.uniform(20, 40))
-                time.sleep(0.3)
-                page.mouse.move(x - random.uniform(5, 15), y)
-                time.sleep(0.2)
-                page.mouse.move(x, y)
-                time.sleep(0.15)
-                page.mouse.click(x, y)
-                time.sleep(5)
+        attempt += 1
+        iframe_n, container_n, _ = detect_cf_elements(page)
+        log(f"🔍 尝试 {attempt}: iframe={iframe_n}, container={container_n}, token={token_len}")
 
-                iframe_n2, _ = detect_cf_elements(page)
-                if iframe_n2 == 0:
-                    log("✅ CF 验证通过！")
-                    return True
-                log("⚠️ iframe 仍在，继续尝试...")
-            except Exception as e:
-                log(f"⚠️ 点击 CF iframe[{i}] 失败: {e}")
+        # 有 iframe → 物理点击
+        if iframe_n > 0:
+            frames = page.locator(CF_IFRAME_SEL)
+            for i in range(frames.count()):
+                try:
+                    box = frames.nth(i).bounding_box()
+                    if not box:
+                        continue
+                    x = box["x"] + 30
+                    y = box["y"] + box["height"] / 2
+                    log(f"🖱️ 物理点击 CF iframe[{i}] ({x:.0f}, {y:.0f})")
+                    page.mouse.move(x - random.uniform(60, 90), y - random.uniform(20, 40))
+                    time.sleep(0.3)
+                    page.mouse.move(x, y)
+                    time.sleep(0.2)
+                    page.mouse.click(x, y)
+                    time.sleep(4)
+                except Exception as e:
+                    log(f"⚠️ 点击 CF iframe[{i}] 失败: {e}")
+        else:
+            # 没 iframe 但有 input，可能是 invisible Turnstile
+            time.sleep(2)
 
-        # 尝试点击 container 内的 checkbox 元素
-        try:
-            cb = page.locator('div.cf-turnstile input[type="checkbox"], [data-sitekey] input[type="checkbox"]').first
-            if cb.count() > 0 and cb.is_visible(timeout=1000):
-                log("🖱️ 尝试点击 container 内的 checkbox")
-                mouse_click_element(page, cb, "Turnstile checkbox")
-                time.sleep(5)
-                iframe_n3, _ = detect_cf_elements(page)
-                if iframe_n3 == 0:
-                    log("✅ CF 验证通过！")
-                    return True
-        except Exception:
-            pass
-
-        time.sleep(2)
-
-    iframe_n_final, _ = detect_cf_elements(page)
-    if iframe_n_final == 0:
-        log("✅ CF 已消失，视为通过")
+    token_len = get_turnstile_token_len(page)
+    log(f"⚠️ Turnstile 处理超时，最终 token 长度={token_len}")
+    if token_len > 0:
         return True
-    log(f"⚠️ CF 处理超时，iframe 仍存在 {iframe_n_final} 个，继续后续流程（可能失败）")
-    return True
+    log("❌ Turnstile 未通过（token 为空）")
+    return False
 
 
 def handle_cloudflare(page):
-    iframe_n, container_n = detect_cf_elements(page)
-    if iframe_n == 0 and container_n == 0:
+    """通用 CF 处理：先检查有无 Turnstile input，再决定是否需要处理"""
+    token_len = get_turnstile_token_len(page)
+    iframe_n, container_n, _ = detect_cf_elements(page)
+
+    # 页面完全没有 Turnstile / CF 元素
+    if token_len < 0 and iframe_n == 0 and container_n == 0:
         return True
+
+    # 有 CF，走完整流程
     return solve_turnstile_checkbox(page)
 
 
@@ -342,10 +358,7 @@ def get_due_date(page, service_url):
 
 
 def click_create_invoice_once(page, create_btn):
-    """
-    点击 Create Invoice 只点 1 次，捕获 /renew POST 和 Location。
-    返回 (posted, status, location)
-    """
+    """点击 Create Invoice 只点 1 次，捕获 POST /renew 和 Location"""
     state = {"posted": False, "status": 0, "location": ""}
 
     def on_response(resp):
@@ -363,7 +376,7 @@ def click_create_invoice_once(page, create_btn):
 
     page.on("response", on_response)
 
-    log("🖱️ 点击 Create Invoice（单次，不重试）...")
+    log("🖱️ 点击 Create Invoice（单次）...")
     clicked = mouse_click_element(page, create_btn, "Create Invoice")
     if not clicked:
         try:
@@ -375,8 +388,8 @@ def click_create_invoice_once(page, create_btn):
                 log(f"❌ 点击失败: {e}")
                 return False, 0, ""
 
-    # 等 10 秒捕获响应
-    for _ in range(20):
+    # 等 15 秒捕获响应（原 10 秒可能不够）
+    for _ in range(30):
         if state["posted"]:
             break
         time.sleep(0.5)
@@ -417,39 +430,25 @@ def find_invoice_urls_via_dom(page, url):
 
     log(f"📝 页面 Title: {page.title()}, URL: {page.url}")
 
-    urls = []
-    try:
-        rows = page.locator('tr, div').filter(has_text=re.compile(r'\bUnpaid\b', re.I))
-        n = rows.count()
-        log(f"🔍 含 Unpaid 的行数: {n}")
-        for i in range(min(n, 20)):
-            try:
-                row = rows.nth(i)
-                link = row.locator('a[href*="/payment/invoice/"]').first
-                if link.count() > 0:
-                    href = link.get_attribute("href")
-                    if href:
-                        if not href.startswith("http"):
-                            href = BASE_URL + href
-                        if href not in urls:
-                            urls.append(href)
-            except Exception:
-                continue
-    except Exception as e:
-        log(f"⚠️ 定位 Unpaid 行失败: {e}")
+    # 拿到整个 HTML
+    html = page.content()
 
-    if not urls:
-        try:
-            html = page.content()
-            found = re.findall(r'href="(/payment/invoice/[a-fA-F0-9\-]{20,})"', html)
-            for u in found:
-                full = BASE_URL + u
-                if full not in urls:
-                    urls.append(full)
-            log(f"🔍 兜底从 HTML 找到 {len(urls)} 个发票链接")
-        except Exception as e:
-            log(f"⚠️ HTML 提取失败: {e}")
+    # 提取所有发票链接（相对 + 绝对）
+    all_links = set()
 
+    # 相对路径
+    for m in re.finditer(r'href="(/payment/invoice/[a-fA-F0-9\-]{20,})"', html):
+        all_links.add(BASE_URL + m.group(1))
+
+    # 绝对路径
+    for m in re.finditer(r'href="(https?://[^"]*?/payment/invoice/[a-fA-F0-9\-]{20,})"', html):
+        all_links.add(m.group(1))
+
+    # 也尝试从 JS/onclick 里找
+    for m in re.finditer(r'/payment/invoice/([a-fA-F0-9\-]{20,})', html):
+        all_links.add(f"{BASE_URL}/payment/invoice/{m.group(1)}")
+
+    urls = list(all_links)
     log(f"🔍 共 {len(urls)} 个发票 URL")
     for i, u in enumerate(urls[:10]):
         log(f"   [{i}] {u}")
@@ -457,7 +456,7 @@ def find_invoice_urls_via_dom(page, url):
     try:
         page.screenshot(path="invoices_page.png", full_page=True)
         with open("invoices_page.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
+            f.write(html)
     except Exception:
         pass
 
@@ -615,8 +614,11 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # CF 处理（等待出现 + 点击）
-    solve_turnstile_checkbox(page)
+    # CF 处理
+    cf_ok = solve_turnstile_checkbox(page)
+    if not cf_ok:
+        log("❌ CF 未通过，本轮跳过 Create Invoice")
+        return False
 
     try:
         page.screenshot(path=f"before_create_invoice_{attempt}.png", full_page=True)
@@ -634,8 +636,8 @@ def click_renew_and_create(page, service_url, attempt=1):
 
     log(f"✅ Create Invoice POST 已触发（{status}），Location: {location}")
 
-    # 等成功提示
-    wait_for_invoice_generated(page, timeout=40)
+    # 等成功提示（可选的进一步确认）
+    wait_for_invoice_generated(page, timeout=30)
 
     return True
 
@@ -650,7 +652,7 @@ def renew_service(page, service_url):
         if result == "NOT_TIME":
             return "NOT_TIME"
         if result is False:
-            log(f"⚠️ 第 {attempt} 轮 Create Invoice POST 未触发")
+            log(f"⚠️ 第 {attempt} 轮失败（CF未通过或POST未触发）")
         else:
             log(f"✅ 第 {attempt} 轮 Create Invoice POST 已触发")
 
