@@ -24,7 +24,8 @@ UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 WAIT_RENDER_BEFORE_CF = 5
 CF_TURNSTILE_TIMEOUT  = 20
 NAV_POLL_SECONDS      = 20
-UNPAID_WAIT_SECONDS   = 20
+SUCCESS_WAIT_SECONDS  = 40   # 等 "Invoice has been generated" 提示
+UNPAID_WAIT_SECONDS   = 40   # 等未付列表链接出现
 WAIT_AFTER_PAY        = 15
 
 
@@ -282,7 +283,9 @@ def get_due_date(page, service_url):
 
 
 def get_unpaid_invoice_urls(page):
-    """访问 /invoices?where=unpaid，纯正则提取所有发票链接"""
+    """
+    访问 /invoices?where=unpaid，等待发票链接出现（或确认空状态）。
+    """
     log(f"🔍 访问未付发票列表: {UNPAID_INVOICES_URL}")
     try:
         page.goto(UNPAID_INVOICES_URL, wait_until="domcontentloaded", timeout=60000)
@@ -293,40 +296,42 @@ def get_unpaid_invoice_urls(page):
     handle_cloudflare(page)
     close_cookie_consent(page)
 
-    start = time.time()
-    urls = []
-    last_html = ""
-    while time.time() - start < UNPAID_WAIT_SECONDS:
-        html = page.content()
-        last_html = html
-        found = re.findall(r'href="(/payment/invoice/[a-f0-9\-]{20,})"', html)
-        urls = []
-        for u in found:
-            full = BASE_URL + u
-            if full not in urls:
-                urls.append(full)
-        if urls:
-            break
-        time.sleep(2)
+    # 先等链接出现
+    try:
+        page.wait_for_selector('a[href*="/payment/invoice/"]', timeout=UNPAID_WAIT_SECONDS * 1000)
+        log("✅ 页面已出现发票链接")
+    except Exception:
+        log(f"⚠️ {UNPAID_WAIT_SECONDS} 秒内未出现发票链接，检查是否为空状态")
 
+    time.sleep(2)  # 稳定
+
+    html = page.content()
     log(f"📝 未付发票页 Title: {page.title()}, URL: {page.url}")
+
+    found = re.findall(r'href="(/payment/invoice/[a-f0-9\-]{20,})"', html)
+    urls = []
+    for u in found:
+        full = BASE_URL + u
+        if full not in urls:
+            urls.append(full)
+
     log(f"🔍 未付发票共 {len(urls)} 个")
     for i, u in enumerate(urls[:5]):
         log(f"   [{i}] {u}")
 
-    # 诊断：页面是否含 "Unpaid" 字样
+    # 诊断
     try:
-        if "unpaid" in last_html.lower():
+        if "unpaid" in html.lower():
             log("🔍 页面含 'unpaid' 字样")
-        else:
-            log("⚠️ 页面不含 'unpaid' 字样，可能未渲染完")
+        if "no invoice" in html.lower() or "no unpaid" in html.lower() or "empty" in html.lower():
+            log("🔍 页面显示空状态提示")
     except Exception:
         pass
 
     try:
         page.screenshot(path="unpaid_invoices.png", full_page=True)
         with open("unpaid_invoices.html", "w", encoding="utf-8") as f:
-            f.write(last_html)
+            f.write(html)
         log("📸 已保存未付发票页")
     except Exception:
         pass
@@ -433,65 +438,28 @@ def try_pay_invoice(page, invoice_url):
     return None
 
 
-def click_create_invoice_with_retry(page, create_btn, max_attempts=4):
-    """
-    点击 Create Invoice，并确认 /renew POST 请求真的发出。
-    返回 True 表示请求已发出。
-    """
-    renew_flag = {"posted": False, "status": 0}
-
-    def on_response(resp):
+def wait_for_invoice_generated(page, timeout=SUCCESS_WAIT_SECONDS):
+    """等待页面出现 'Invoice has been generated' 或类似成功提示"""
+    log(f"⏳ 等待页面出现 'Invoice has been generated' 提示（最多 {timeout} 秒）...")
+    start = time.time()
+    while time.time() - start < timeout:
         try:
-            if resp.request.method == "POST" and "/renew" in resp.url:
-                renew_flag["posted"] = True
-                renew_flag["status"] = resp.status
-                log(f"🌐 捕获 POST /renew 状态: {resp.status}")
+            body_text = page.locator("body").inner_text().lower()
+            if "invoice has been generated" in body_text:
+                log("✅ 页面出现 'Invoice has been generated' 提示")
+                return True
+            if "generated successfully" in body_text:
+                log("✅ 页面出现 'generated successfully' 提示")
+                return True
         except Exception:
             pass
-
-    page.on("response", on_response)
-
-    for attempt in range(1, max_attempts + 1):
-        log(f"🖱️ 第 {attempt}/{max_attempts} 次点击 Create Invoice...")
-
-        # 检查按钮是否 disabled
-        try:
-            if create_btn.is_disabled():
-                log("⚠️ Create Invoice 当前 disabled，等 3 秒...")
-                time.sleep(3)
-        except Exception:
-            pass
-
-        # 点击
-        clicked = mouse_click_element(page, create_btn, f"Create Invoice(尝试{attempt})")
-        if not clicked:
-            try:
-                create_btn.click(timeout=5000)
-            except Exception:
-                try:
-                    create_btn.evaluate("el => el.click()")
-                except Exception as e:
-                    log(f"⚠️ 所有点击方式失败: {e}")
-
-        # 等 5 秒看 POST 是否发出
-        for _ in range(10):
-            if renew_flag["posted"]:
-                break
-            time.sleep(0.5)
-
-        if renew_flag["posted"]:
-            log(f"✅ Create Invoice 已触发 /renew POST（状态 {renew_flag['status']}）")
-            return True
-
-        log(f"⚠️ 第 {attempt} 次点击未触发 /renew POST，重试...")
-        time.sleep(3)
-
-    log("❌ 多次点击 Create Invoice 均未触发 /renew")
+        time.sleep(1)
+    log(f"⚠️ {timeout} 秒内未出现成功提示")
     return False
 
 
 def click_renew_and_create(page, service_url, attempt=1):
-    """点 Renew → 等弹窗 → 处理 CF → 点 Create Invoice（带重试）"""
+    """点 Renew → 等弹窗 → 处理 CF → 点 Create Invoice（单次）→ 等成功提示"""
     log(f"🔄 第 {attempt} 轮: 点击 Renew → Create Invoice")
     try:
         if service_url not in page.url:
@@ -555,11 +523,23 @@ def click_renew_and_create(page, service_url, attempt=1):
     except Exception:
         pass
 
-    # 核心：点击 Create Invoice 并确认 POST 发出
-    if not click_create_invoice_with_retry(page, create_btn):
-        return False
+    log("🖱️ 点击 'Create Invoice'（单次）...")
+    if not mouse_click_element(page, create_btn, "Create Invoice"):
+        try:
+            create_btn.click(timeout=5000)
+        except Exception:
+            try:
+                create_btn.evaluate("el => el.click()")
+            except Exception as e:
+                log(f"❌ 点击 Create Invoice 失败: {e}")
+                return False
 
-    return True
+    # 等成功提示
+    if wait_for_invoice_generated(page, timeout=SUCCESS_WAIT_SECONDS):
+        return True
+
+    log("⚠️ 未出现成功提示，本轮的点击可能未生效")
+    return False
 
 
 def renew_service(page, service_url):
@@ -573,9 +553,10 @@ def renew_service(page, service_url):
         if result == "NOT_TIME":
             return "NOT_TIME"
         if result is False:
-            log(f"⚠️ 第 {attempt} 轮点击失败")
-            time.sleep(5)
-            continue
+            log(f"⚠️ 第 {attempt} 轮点击 Create Invoice 未确认成功")
+            # 仍然试一下未付列表
+        else:
+            log(f"✅ 第 {attempt} 轮 Create Invoice 已确认")
 
         # 短轮询自动跳转
         log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒...")
