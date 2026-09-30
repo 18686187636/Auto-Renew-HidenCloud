@@ -22,9 +22,15 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF = 5
-CF_TURNSTILE_TIMEOUT  = 30  # 增加超时时间
+CF_TURNSTILE_TIMEOUT  = 45   # 增加到 45 秒，给 Turnstile 更多时间
 NAV_POLL_SECONDS      = 30
 WAIT_AFTER_PAY        = 15
+
+TURNSTILE_IFRAME_SEL = (
+    'iframe[src*="challenges.cloudflare.com"], '
+    'iframe[title*="cloudflare"], '
+    'iframe[src*="turnstile"]'
+)
 
 
 def log(message):
@@ -44,7 +50,15 @@ def mask_email(email):
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 window.chrome = { runtime: {} };
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
 """
 
 
@@ -100,7 +114,9 @@ def mouse_click_element(page, locator, label=""):
         time.sleep(random.uniform(0.15, 0.35))
         page.mouse.move(x, y)
         time.sleep(random.uniform(0.08, 0.18))
-        page.mouse.click(x, y)
+        page.mouse.down()
+        time.sleep(random.uniform(0.05, 0.15))
+        page.mouse.up()
         return True
     except Exception as e:
         log(f"⚠️ 物理点击 {label} 失败: {e}")
@@ -108,17 +124,16 @@ def mouse_click_element(page, locator, label=""):
 
 
 def handle_cloudflare(page):
-    iframe_sel = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="cloudflare"], iframe[src*="turnstile"]'
-    if page.locator(iframe_sel).count() == 0:
+    if page.locator(TURNSTILE_IFRAME_SEL).count() == 0:
         return True
     log("⚠️ 检测到 Cloudflare 验证...")
     start = time.time()
     while time.time() - start < 60:
-        if page.locator(iframe_sel).count() == 0:
+        if page.locator(TURNSTILE_IFRAME_SEL).count() == 0:
             log("✅ CF 验证通过！")
             return True
         try:
-            box = page.locator(iframe_sel).first.bounding_box()
+            box = page.locator(TURNSTILE_IFRAME_SEL).first.bounding_box()
             if box:
                 x = box["x"] + 30
                 y = box["y"] + box["height"] / 2
@@ -131,64 +146,149 @@ def handle_cloudflare(page):
     return False
 
 
-def solve_turnstile_checkbox(page, timeout=30):
-    """优化的 Turnstile 处理，直接检查隐藏 input 的值"""
-    iframe_sel = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="cloudflare"], iframe[src*="turnstile"]'
-    start = time.time()
-    
-    while time.time() - start < timeout:
-        # 优先检查隐藏 input 是否有值
-        try:
-            val = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value")
-            if val and len(val) > 10:
-                log("✅ CF Turnstile response 已填充，验证通过")
-                return True
-        except Exception:
-            pass
+def _get_turnstile_token(page):
+    """检查 cf-turnstile-response 隐藏 input 是否已被填充"""
+    try:
+        val = page.evaluate(
+            "() => { const el = document.querySelector('input[name=\"cf-turnstile-response\"]'); return el ? el.value : ''; }"
+        )
+        return val or ""
+    except Exception:
+        return ""
 
-        frames = page.locator(iframe_sel)
-        n = frames.count()
-        if n == 0:
-            time.sleep(2)
-            # 再次检查 input
-            try:
-                val = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value")
-                if val and len(val) > 10:
-                    log("✅ CF Turnstile response 已填充，验证通过")
-                    return True
-            except Exception:
-                pass
+
+def solve_turnstile_checkbox(page, timeout=45):
+    """
+    三重策略处理 Cloudflare Turnstile：
+      A. 遍历 page.frames，直接在 CF frame 内部点击 checkbox / body
+      B. frame_locator + position 在 iframe 内部坐标点击
+      C. 外层 page 鼠标坐标点击 + down/up 模拟人类行为
+    每次点击后都检查 cf-turnstile-response token 是否已填充。
+    """
+    log(f"🔒 开始处理 Turnstile (超时 {timeout}s)")
+    start = time.time()
+    attempt = 0
+
+    while time.time() - start < timeout:
+        attempt += 1
+
+        # 1. 检查 token 是否已填充
+        token = _get_turnstile_token(page)
+        if token and len(token) > 10:
+            log(f"✅ Turnstile token 已填充 (len={len(token)}, attempt={attempt})")
+            return True
+
+        # 2. 每次循环都尝试关闭 Cookie 横幅
+        close_cookie_consent(page)
+
+        iframe_count = page.locator(TURNSTILE_IFRAME_SEL).count()
+        if iframe_count == 0:
+            # iframe 已消失，再确认一次 token
+            time.sleep(1)
+            token = _get_turnstile_token(page)
+            if token and len(token) > 10:
+                log(f"✅ Turnstile 已通过（iframe 消失）")
+                return True
+            time.sleep(1)
             continue
 
-        log(f"🔍 检测到 {n} 个 CF iframe")
-        for i in range(n):
+        log(f"🔍 attempt={attempt}: 检测到 {iframe_count} 个 CF iframe")
+
+        # ===== 策略 A：直接操作 frame 对象 =====
+        try:
+            for frame in page.frames:
+                furl = frame.url or ""
+                if "challenges.cloudflare.com" in furl:
+                    # A1：尝试内部 checkbox 元素
+                    try:
+                        cb = frame.locator('input[type="checkbox"]').first
+                        if cb.count() > 0:
+                            cb.click(timeout=2000, force=True)
+                            log("  ✅ A1: frame 内部 checkbox 点击")
+                            time.sleep(2)
+                    except Exception as e:
+                        log(f"  A1 失败: {e}")
+                    # A2：尝试内部 [role=checkbox]
+                    try:
+                        rcb = frame.locator('[role="checkbox"]').first
+                        if rcb.count() > 0:
+                            rcb.click(timeout=2000, force=True)
+                            log("  ✅ A2: frame 内部 role=checkbox 点击")
+                            time.sleep(2)
+                    except Exception:
+                        pass
+                    # A3：直接点击 frame body 的 checkbox 区域
+                    try:
+                        frame.locator('body').click(
+                            position={"x": 30, "y": 32},
+                            timeout=2000, force=True
+                        )
+                        log("  ✅ A3: frame body 坐标点击")
+                        time.sleep(2)
+                    except Exception as e:
+                        log(f"  A3 失败: {e}")
+        except Exception as e:
+            log(f"  策略A 异常: {e}")
+
+        # A 策略点击后检查 token
+        token = _get_turnstile_token(page)
+        if token and len(token) > 10:
+            log(f"✅ Turnstile token 已填充 (len={len(token)})")
+            return True
+
+        # ===== 策略 B：frame_locator + position =====
+        try:
+            fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first
             try:
-                box = frames.nth(i).bounding_box()
-                if not box:
-                    continue
-                x = box["x"] + 30
-                y = box["y"] + box["height"] / 2
-                log(f"🖱️ 物理点击 CF iframe[{i}] ({x:.0f}, {y:.0f})")
-                page.mouse.move(x - 80, y - 40)
-                time.sleep(0.3)
-                page.mouse.move(x, y)
-                time.sleep(0.15)
-                page.mouse.click(x, y)
-                time.sleep(4)  # 等待验证完成
-                
-                # 点击后立即检查 input
-                try:
-                    val = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value")
-                    if val and len(val) > 10:
-                        log("✅ CF Turnstile response 已填充，验证通过")
-                        return True
-                except Exception:
-                    pass
-                    
+                body = fl.locator('body').first
+                body.click(position={"x": 30, "y": 32}, timeout=3000, force=True)
+                log("  ✅ B: frame_locator body 坐标点击")
             except Exception as e:
-                log(f"⚠️ 点击 CF 失败: {e}")
+                log(f"  B 失败: {e}")
+        except Exception as e:
+            log(f"  策略B 异常: {e}")
+
         time.sleep(2)
-    
+
+        token = _get_turnstile_token(page)
+        if token and len(token) > 10:
+            log(f"✅ Turnstile token 已填充 (len={len(token)})")
+            return True
+
+        # ===== 策略 C：外层鼠标坐标点击 =====
+        try:
+            box = page.locator(TURNSTILE_IFRAME_SEL).first.bounding_box()
+            if box:
+                # 尝试 2 个不同的水平位置
+                for ratio in (0.05, 0.09):
+                    x = box["x"] + box["width"] * ratio
+                    y = box["y"] + box["height"] / 2
+                    log(f"  🖱️ C: 物理点击 ({x:.0f}, {y:.0f})")
+                    # 模拟人类移动
+                    page.mouse.move(
+                        x - random.uniform(70, 110),
+                        y - random.uniform(30, 55)
+                    )
+                    time.sleep(random.uniform(0.25, 0.45))
+                    page.mouse.move(
+                        x + random.uniform(-3, 3),
+                        y + random.uniform(-3, 3)
+                    )
+                    time.sleep(random.uniform(0.1, 0.25))
+                    page.mouse.down()
+                    time.sleep(random.uniform(0.05, 0.14))
+                    page.mouse.up()
+                    time.sleep(2)
+
+                    token = _get_turnstile_token(page)
+                    if token and len(token) > 10:
+                        log(f"✅ Turnstile token 已填充 (len={len(token)})")
+                        return True
+        except Exception as e:
+            log(f"  策略C 异常: {e}")
+
+        time.sleep(2)
+
     log("❌ CF Turnstile 验证超时")
     return False
 
@@ -198,25 +298,28 @@ def close_cookie_consent(page):
     try:
         if page.locator('.fc-consent-root').count() == 0:
             return
-        # 尝试点击按钮
         for sel in [
-            'button:has-text("Accept")', 'button:has-text("Accept All")',
-            'button:has-text("I agree")', 'button:has-text("Allow")',
+            'button:has-text("Accept")',
+            'button:has-text("Accept All")',
+            'button:has-text("I agree")',
+            'button:has-text("Allow")',
             '.fc-cta-consent',
         ]:
             try:
                 btn = page.locator(sel).first
-                if btn.is_visible():
-                    btn.click()
-                    log("🍪 已关闭 Cookie 同意横幅")
-                    time.sleep(1)
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click(timeout=1500)
+                    log("🍪 已点击关闭 Cookie 横幅")
+                    time.sleep(0.8)
                     return
             except Exception:
                 continue
-        # 如果点击失效，直接移除 DOM
-        page.evaluate("document.querySelector('.fc-consent-root')?.remove()")
-        log("🍪 已通过 JS 移除 Cookie 同意横幅")
-        time.sleep(1)
+        try:
+            page.evaluate("document.querySelector('.fc-consent-root')?.remove()")
+            log("🍪 已 JS 移除 Cookie 横幅")
+            time.sleep(0.5)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -535,12 +638,9 @@ def renew_service(page, service_url):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    log("🔒 处理 CF Turnstile...")
-    if not solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
-        log("❌ CF Turnstile 验证失败，无法创建发票")
-        return False
-
-    log(f"🔍 点击前 URL: {page.url}")
+    # 关闭 Cookie 横幅（可能会在弹窗出现后再次渲染）
+    close_cookie_consent(page)
+    time.sleep(0.5)
 
     try:
         page.screenshot(path="before_create_invoice.png", full_page=True)
@@ -548,6 +648,17 @@ def renew_service(page, service_url):
             f.write(page.content())
     except Exception:
         pass
+
+    log("🔒 处理 CF Turnstile...")
+    if not solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
+        log("❌ CF Turnstile 验证失败，无法创建发票")
+        try:
+            page.screenshot(path="cf_failed.png", full_page=True)
+        except Exception:
+            pass
+        return False
+
+    log(f"🔍 点击 Create Invoice 前 URL: {page.url}")
 
     log("🖱️ 物理点击 'Create Invoice'...")
     clicked = False
@@ -579,8 +690,12 @@ def renew_service(page, service_url):
     time.sleep(3)
     try:
         body_text = page.locator("body").inner_text()
-        if "cf-turnstile-response" in body_text or "Error!" in body_text:
+        if "cf-turnstile-response" in body_text or "field is required" in body_text:
             log("❌ 检测到错误：cf-turnstile-response field is required，CF 验证未通过或未提交")
+            try:
+                page.screenshot(path="cf_error_after_click.png", full_page=True)
+            except Exception:
+                pass
             return False
     except Exception:
         pass
@@ -666,7 +781,9 @@ def process_account(identifier, email, password, cookie_value, browser):
     context = browser.new_context(
         viewport={'width': 1920, 'height': 1080},
         user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        proxy={"server": PROXY_SERVER} if IS_PROXY else None
+        proxy={"server": PROXY_SERVER} if IS_PROXY else None,
+        locale='en-US',
+        timezone_id='Europe/Berlin',
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
@@ -747,7 +864,13 @@ def main():
             log("🚀 启动浏览器...")
             browser = p.chromium.launch(
                 headless=False,
-                args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+                args=[
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-infobars',
+                    '--disable-dev-shm-usage',
+                    '--window-size=1920,1080',
+                ]
             )
 
             all_success = True
