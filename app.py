@@ -150,7 +150,6 @@ def wait_out_cf_challenge(page, max_wait=40):
 
 
 def login(page, email, password, cookie_value):
-    """优先 Cookie 登录（Playwright 下稳定），失败再用密码"""
     if cookie_value:
         log("📇 尝试 Cookie 登录...")
         try:
@@ -251,10 +250,6 @@ def get_due_date(page, service_url):
 
 
 def click_create_invoice_with_retry(page, create_btn):
-    """
-    优先物理坐标点击（Playwright 下最有效，16:00 那次成功就靠它）
-    再尝试其他方式
-    """
     state = {"posted": False, "status": 0, "location": ""}
 
     def on_response(resp):
@@ -277,19 +272,12 @@ def click_create_invoice_with_retry(page, create_btn):
     except Exception:
         pass
 
-    # 第 1、2 次：物理坐标点击（关键！）
-    # 第 3 次：playwright click
-    # 第 4 次：js click
-    # 第 5 次：form submit
-
     for attempt in range(1, CLICK_MAX_ATTEMPTS + 1):
         state["posted"] = False
 
         if attempt == 1 or attempt == 2:
             method_name = f"mouse-coord-{attempt}"
             log(f"🖱️ 第 {attempt}/{CLICK_MAX_ATTEMPTS} 次点击（方法: {method_name}）...")
-
-            # 物理坐标点击：滚动到元素，拿 bounding box，鼠标移动 + 点击
             try:
                 create_btn.scroll_into_view_if_needed(timeout=5000)
                 time.sleep(0.5)
@@ -298,7 +286,6 @@ def click_create_invoice_with_retry(page, create_btn):
                     x = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
                     y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
                     log(f"   📍 坐标 ({x:.0f}, {y:.0f})")
-                    # 真实鼠标轨迹
                     page.mouse.move(x - random.uniform(40, 80), y - random.uniform(20, 40), steps=random.randint(8, 15))
                     time.sleep(random.uniform(0.15, 0.35))
                     page.mouse.move(x - random.uniform(5, 15), y - random.uniform(3, 8), steps=random.randint(3, 6))
@@ -350,7 +337,6 @@ def click_create_invoice_with_retry(page, create_btn):
             except Exception as e:
                 log(f"   ⚠️ {e}")
 
-        # 等 WAIT_AFTER_CLICK 秒捕获 POST
         for i in range(WAIT_AFTER_CLICK * 2):
             time.sleep(0.5)
             if state["posted"]:
@@ -491,7 +477,6 @@ def try_pay_invoice(page, invoice_url):
 
                 if text == "Pay" or re.match(r"^Pay\s*[€$£]?\d", text):
                     log(f"✅ 锁定: {text!r}")
-                    # 优先物理坐标点击
                     clicked = False
                     try:
                         btn.scroll_into_view_if_needed(timeout=5000)
@@ -577,7 +562,6 @@ def click_renew_and_create(page, service_url, attempt=1):
             renew_btn.wait_for(state="visible", timeout=10000)
             renew_btn.scroll_into_view_if_needed()
             log(f"🖱️ 点击 'Renew'（第 {i+1} 次）")
-            # 物理坐标点击 Renew
             try:
                 box = renew_btn.bounding_box()
                 if box:
@@ -623,7 +607,6 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # 简单检查一下 token（不阻断）
     tl = get_turnstile_token_len(page)
     log(f"🔍 Turnstile token 长度: {tl}")
 
@@ -734,13 +717,22 @@ def renew_service(page, service_url):
 
 def process_account(identifier, email, password, cookie_value, browser):
     log(f"=== 开始处理账号: {mask_email(email) or identifier} ===")
+
+    # 每个账号的录屏目录
+    safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', identifier)
+    video_dir = os.path.join("videos", safe_id)
+    os.makedirs(video_dir, exist_ok=True)
+
     context = browser.new_context(
         viewport={'width': 1920, 'height': 1080},
         user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        proxy={"server": PROXY_SERVER} if IS_PROXY else None
+        proxy={"server": PROXY_SERVER} if IS_PROXY else None,
+        record_video_dir=video_dir,           # ← 录屏
+        record_video_size={'width': 1280, 'height': 720},
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
+    log(f"🎬 已开启录屏，视频目录: {video_dir}/")
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
@@ -787,11 +779,16 @@ def process_account(identifier, email, password, cookie_value, browser):
             log(f"⚠️ 通知失败: {e}")
         try:
             context.close()
-        except Exception:
-            pass
+            # close 后视频才会真正写入磁盘
+            time.sleep(1)
+            log(f"🎬 录屏已保存到 {video_dir}/")
+        except Exception as e:
+            log(f"⚠️ context 关闭失败: {e}")
 
 
 def main():
+    os.makedirs("videos", exist_ok=True)
+
     if ACCOUNTS_JSON:
         try:
             accounts = json.loads(ACCOUNTS_JSON)
