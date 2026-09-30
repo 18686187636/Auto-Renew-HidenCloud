@@ -12,14 +12,14 @@ permissions:
 jobs:
   Renew-HidenCloud:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30   # 多账号时 15 分钟不够，改为 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
           pip install playwright requests 'requests[socks]'
-          python -m playwright install --with-deps chromium   # 使用 Chromium
+          python -m playwright install --with-deps chromium
 
       - name: ⚙ 设置代理 (sing-box)
         env:
@@ -37,6 +37,8 @@ jobs:
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🚀 运行续期脚本
+        id: renew
+        continue-on-error: true
         env:
           # 多账号 JSON（可选），若配置则忽略下方单账号凭证
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
@@ -50,7 +52,19 @@ jobs:
           # 代理配置（固定值，因为代理脚本已在本地启动）
           IS_PROXY: 'true'
           PROXY_SERVER: 'socks5://127.0.0.1:1080'
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
+
+      - name: 📤 上传诊断截图和 HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots-${{ github.run_number }}
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 🧽 清理进程和临时文件
         if: always()
@@ -75,3 +89,9 @@ jobs:
               gh run delete $run_id || true
             fi
           done
+
+      - name: ❌ 若脚本失败则标记 job 失败
+        if: steps.renew.outcome == 'failure'
+        run: |
+          echo "续期脚本执行失败，请查看上方日志和 Artifact 截图。"
+          exit 1
