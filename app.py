@@ -20,14 +20,31 @@ IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
+# 发票 URL 关键词（放宽匹配）
+INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billing/invoice")
+
 # 日志
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+
+def mask_email(email):
+    """脱敏邮箱"""
+    if not email:
+        return "未知账号"
+    if '@' in email:
+        name, domain = email.split('@', 1)
+        if len(name) > 4:
+            return f"{name[:2]}****{name[-2:]}@{domain}"
+        return f"{name}@{domain}"
+    return email[:2] + '****'
+
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = { runtime: {} };
 """
+
 
 def get_current_ip(proxy_server=None):
     """获取当前出口IP"""
@@ -41,28 +58,20 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
+
 def send_telegram_notification(status, old_due, new_due, email):
-    """发送 Telegram 通知，增加 email 参数以标识账号"""
+    """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
-    
+
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    # 脱敏邮箱
-    if '@' in email:
-        name, domain = email.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = email[:2] + '****'
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
         f"{status}\n"
-        f"👤 账号: {masked_email}\n"
+        f"👤 账号: {mask_email(email)}\n"
         f"📅 续期前到期：{old_due}\n"
         f"📅 续期后到期：{new_due}\n"
         f"🕒 续期时间：{now}"
@@ -78,12 +87,12 @@ def send_telegram_notification(status, old_due, new_due, email):
         if resp.status_code == 200:
             log("✅ Telegram 通知发送成功")
             return True
-        else:
-            log(f"❌ Telegram 通知失败: {resp.text}")
-            return False
+        log(f"❌ Telegram 通知失败: {resp.text}")
+        return False
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
 
 def handle_cloudflare(page):
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
@@ -111,43 +120,41 @@ def handle_cloudflare(page):
     log("❌ 验证超时。")
     return False
 
+
 def close_cookie_consent(page):
-    """
-    检测并关闭页面上的 Cookie 同意弹窗（如 fc-consent-root）。
-    支持多种弹窗样式。
-    """
+    """检测并关闭页面上的 Cookie 同意弹窗"""
     try:
-        # 等待弹窗出现（最多 3 秒）
         consent_root = page.locator('.fc-consent-root')
         if consent_root.count() == 0:
-            return  # 没有弹窗
+            return
 
         log("🍪 检测到 Cookie 同意弹窗，尝试关闭...")
 
-        # 常见按钮文本和选择器
         accept_selectors = [
             'button:has-text("Accept")',
             'button:has-text("Accept All")',
             'button:has-text("I agree")',
             'button:has-text("Allow")',
             'button:has-text("OK")',
-            '.fc-cta-consent',  # 常见的类
+            '.fc-cta-consent',
             '.fc-button:has-text("Accept")',
         ]
 
         for selector in accept_selectors:
             try:
                 btn = page.locator(selector).first
-                if btn.is_visible(timeout=1000):
-                    btn.click()
-                    log("✅ 点击了接受按钮")
-                    # 等待弹窗消失
+                btn.wait_for(state="visible", timeout=1000)
+                btn.click()
+                log("✅ 点击了接受按钮")
+                try:
                     page.wait_for_selector('.fc-consent-root', state='detached', timeout=5000)
-                    return
-            except:
+                except Exception:
+                    pass
+                return
+            except Exception:
                 continue
 
-        # 如果找不到按钮，尝试用 JavaScript 移除覆盖层（应急）
+        # 找不到按钮就 JS 移除
         page.evaluate("""
             document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-header').forEach(el => el.remove());
         """)
@@ -155,7 +162,7 @@ def close_cookie_consent(page):
 
     except Exception as e:
         log(f"⚠️ 关闭 Cookie 弹窗时出错: {e}")
-        # 不中断流程
+
 
 def login(page, email, password, cookie_value):
     """使用给定凭证登录，返回是否成功"""
@@ -178,17 +185,25 @@ def login(page, email, password, cookie_value):
             page_title = page.title()
             log(f"📝 当前Title: {page_title}")
             if "auth/login" not in page.url:
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
+                log("✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
             log("❌ Cookie 失效，请更换")
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️ Cookie 登录异常: {e}")
 
     # 2. 账号密码登录
     if not email or not password:
+        log("⚠️ 无可用账号密码，跳过密码登录")
         return False
+
     log("💣 尝试账号密码登录...")
     try:
+        # 清掉可能残留的失效 Cookie，避免干扰
+        try:
+            page.context.clear_cookies()
+        except Exception:
+            pass
+
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         page.fill('input[name="email"]', email)
@@ -206,12 +221,13 @@ def login(page, email, password, cookie_value):
         if "auth/login" in page.url:
             log("❌ 登录失败。")
             return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+        log("✅ 账号密码登录成功！当前已到达dashboard页面")
         return True
     except Exception as e:
         log(f"❌ 登录异常: {e}")
         page.screenshot(path="login_fail.png")
         return False
+
 
 def get_server_id(page):
     try:
@@ -239,17 +255,20 @@ def get_server_id(page):
         page.screenshot(path="server_id_error.png")
         return None
 
+
 def get_due_date(page, service_url):
     try:
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        close_cookie_consent(page)  # 确保弹窗不遮挡内容
+        close_cookie_consent(page)
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
             r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
             r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"Due date\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
+            r"Due date\s*[:\-]?\s*([A-Za-z]{3}\s+\d{1,2},?\s+\d{4})",
         ]
         for pattern in patterns:
             match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
@@ -261,18 +280,19 @@ def get_due_date(page, service_url):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
+
 def renew_service(page, service_url):
     log("➡ 进入续期流程...")
-    close_cookie_consent(page)  # 初始清理
+    close_cookie_consent(page)
 
     if page.url != service_url:
         page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-    close_cookie_consent(page)  # 跳转后再次清理
+    close_cookie_consent(page)
     handle_cloudflare(page)
 
     log("🖱️ 准备点击 'Renew' 按钮...")
-    renew_btn = page.locator('button:has-text("Renew")')
-    create_btn = page.locator('button:has-text("Create Invoice")')
+    renew_btn = page.locator('button:has-text("Renew")').first
+    create_btn = page.locator('button:has-text("Create Invoice")').first
 
     modal_opened = False
     for i in range(3):
@@ -280,7 +300,6 @@ def renew_service(page, service_url):
             renew_btn.wait_for(state="visible", timeout=10000)
             renew_btn.scroll_into_view_if_needed()
             log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-            # 点击前再次清理弹窗
             close_cookie_consent(page)
             renew_btn.click()
 
@@ -297,7 +316,7 @@ def renew_service(page, service_url):
                 modal_opened = True
                 log("✅ 弹窗已成功弹出！")
                 break
-            except:
+            except Exception:
                 log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                 time.sleep(2)
         except Exception as e:
@@ -309,15 +328,100 @@ def renew_service(page, service_url):
         return False
 
     handle_cloudflare(page)
-    close_cookie_consent(page)  # 点击Create Invoice前清理
-    log("🖱️ 点击 'Create Invoice'...")
-    create_btn.click()
+    close_cookie_consent(page)
 
+    # === 关键新增：弹窗弹出后等待 20 秒让页面渲染 / 校验完成 ===
+    log("⏳ 弹窗已弹出，等待 20 秒让页面渲染/校验完成...")
+    time.sleep(20)
+
+    # 点击前诊断
+    try:
+        disabled = create_btn.is_disabled()
+        log(f"🔍 Create Invoice disabled = {disabled}")
+    except Exception as e:
+        log(f"⚠️ 检查按钮状态失败: {e}")
+
+    checkbox_count = page.locator('input[type="checkbox"]').count()
+    log(f"🔍 弹窗内 checkbox 数量: {checkbox_count}")
+
+    # 勾选所有未勾选的 checkbox
+    try:
+        unchecked = page.locator('input[type="checkbox"]:not(:checked)')
+        n = unchecked.count()
+        for i in range(n):
+            try:
+                unchecked.nth(i).check(force=True)
+                log(f"✅ 勾选第 {i+1} 个 checkbox")
+                time.sleep(0.3)
+            except Exception as e:
+                log(f"⚠️ 勾选第 {i+1} 个 checkbox 失败: {e}")
+    except Exception as e:
+        log(f"⚠️ 处理 checkbox 出错: {e}")
+
+    # 等按钮变成可用
+    for _ in range(20):
+        try:
+            if not create_btn.is_disabled():
+                break
+        except Exception:
+            break
+        time.sleep(0.5)
+
+    # 记录点击前的页面数（用于检测新标签页）
+    pages_before = len(page.context.pages)
+
+    log("🖱️ 点击 'Create Invoice'...")
+    try:
+        create_btn.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    clicked = False
+    try:
+        create_btn.click(timeout=5000)
+        clicked = True
+    except Exception as e:
+        log(f"⚠️ 普通点击失败，尝试 JS 点击: {e}")
+        try:
+            create_btn.evaluate("el => el.click()")
+            clicked = True
+        except Exception as e2:
+            log(f"❌ JS 点击也失败: {e2}")
+
+    if not clicked:
+        page.screenshot(path="create_invoice_click_failed.png")
+        return False
+
+    # 点击后等 3 秒，保存现场
+    time.sleep(3)
+    try:
+        page.screenshot(path="after_create_invoice_click.png", full_page=True)
+        with open("after_create_invoice_click.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log("📸 已保存点击后截图和 HTML")
+    except Exception as e:
+        log(f"⚠️ 保存现场失败: {e}")
+
+    # 检测是否打开了新标签页
+    pages_after = len(page.context.pages)
+    log(f"🔍 点击后页面数: {pages_before} -> {pages_after}")
+    if pages_after > pages_before:
+        new_page = page.context.pages[-1]
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+        log(f"✅ 检测到新标签页: {new_page.url}")
+        if any(k in new_page.url for k in ("/invoice", "/payment", "/billing")):
+            page = new_page
+
+    # 等待跳转到发票页面
     new_invoice_url = None
     start_wait = time.time()
     while time.time() - start_wait < 90:
-        if "/payment/invoice/" in page.url:
-            new_invoice_url = page.url
+        cur = page.url
+        if any(k in cur for k in INVOICE_URL_KEYWORDS):
+            new_invoice_url = cur
             log(f"🎉 页面已跳转: {new_invoice_url}")
             break
         if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
@@ -327,7 +431,10 @@ def renew_service(page, service_url):
 
     if not new_invoice_url:
         log("❌ 未能进入发票页面，超时。")
-        page.screenshot(path="renew_stuck_invoice.png")
+        try:
+            page.screenshot(path="renew_stuck_invoice.png", full_page=True)
+        except Exception:
+            pass
         return False
 
     if page.url != new_invoice_url:
@@ -335,20 +442,26 @@ def renew_service(page, service_url):
     handle_cloudflare(page)
 
     log("🔎 查找 'Pay' 按钮...")
-    pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-    pay_btn.wait_for(state="visible", timeout=30000)
-    pay_btn.click()
-    log("✅ 'Pay' 按钮已点击。")
+    try:
+        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn.wait_for(state="visible", timeout=30000)
+        pay_btn.click()
+        log("✅ 'Pay' 按钮已点击。")
+    except Exception as e:
+        log(f"❌ 点击 'Pay' 失败: {e}")
+        page.screenshot(path="pay_btn_failed.png")
+        return False
 
     time.sleep(5)
     page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
     handle_cloudflare(page)
-    close_cookie_consent(page)  # 最后清理一次
+    close_cookie_consent(page)
     return True
 
-def process_account(email, password, cookie_value, browser):
+
+def process_account(identifier, email, password, cookie_value, browser):
     """处理单个账号的续期，返回 (status, old_due, new_due)"""
-    log(f"=== 开始处理账号: {email} ===")
+    log(f"=== 开始处理账号: {mask_email(email) or identifier} ===")
     context = browser.new_context(
         viewport={'width': 1920, 'height': 1080},
         user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -357,30 +470,29 @@ def process_account(email, password, cookie_value, browser):
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
 
+    status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
         # 登录
         if not login(page, email, password, cookie_value):
-            log(f"❌ 账号 {email} 登录失败，跳过续期")
-            return ("登录失败", "未知", "未知")
+            status = "❌ 登录失败"
+            return (status, old_due, new_due)
 
-        # 登录成功后关闭可能出现的 Cookie 弹窗
         close_cookie_consent(page)
 
         # 获取 Server ID
         server_id = get_server_id(page)
         if not server_id:
-            log(f"❌ 账号 {email} 无法获取 Server ID，跳过续期")
-            return ("获取Server ID失败", "未知", "未知")
+            status = "❌ 获取Server ID失败"
+            return (status, old_due, new_due)
         service_url = f"{BASE_URL}/service/{server_id}/manage"
 
-        # 获取旧到期时间
+        # 旧到期时间
         old_due = get_due_date(page, service_url)
         log(f"📆 续费前到期时间：{old_due}")
 
         # 执行续期
         renew_result = renew_service(page, service_url)
 
-        new_due = old_due
         if renew_result == "NOT_TIME":
             log("⏳ 未到续期时间，目前无法续期")
             status = "⏳ 未到续期时间"
@@ -390,20 +502,31 @@ def process_account(email, password, cookie_value, browser):
         else:
             new_due = get_due_date(page, service_url)
             log(f"📆 续费后到期时间：{new_due}")
-            status = "✅ 续期成功"
-
-        # 发送通知
-        send_telegram_notification(status, old_due, new_due, email)
+            if new_due != "未知" and new_due == old_due:
+                status = "⚠️ 续期后到期时间未变化"
+            else:
+                status = "✅ 续期成功"
         return (status, old_due, new_due)
 
     except Exception as e:
-        log(f"❌ 处理账号 {email} 时发生异常: {e}")
-        return ("异常", "未知", "未知")
+        log(f"❌ 处理账号 {mask_email(email) or identifier} 时发生异常: {e}")
+        status = f"❌ 异常: {e}"
+        return (status, old_due, new_due)
+
     finally:
-        context.close()
+        # 无论成功失败都发通知
+        try:
+            send_telegram_notification(status, old_due, new_due, email or identifier)
+        except Exception as e:
+            log(f"⚠️ 发送通知失败: {e}")
+        try:
+            context.close()
+        except Exception:
+            pass
+
 
 def main():
-    # 检查必要凭证
+    # 检查凭证
     if ACCOUNTS_JSON:
         try:
             accounts = json.loads(ACCOUNTS_JSON)
@@ -415,48 +538,52 @@ def main():
             sys.exit(1)
         log(f"📋 多账号模式，共 {len(accounts)} 个账号")
     else:
-        # 单账号模式（兼容）
         if not COOKIE_VALUE and not (EMAIL and PASSWORD):
             log("❌ 缺少登录凭证，请提供 COOKIE_VALUE 或 EMAIL+PASSWORD")
             sys.exit(1)
         accounts = [{"email": EMAIL, "password": PASSWORD, "cookie": COOKIE_VALUE}]
         log("📋 单账号模式")
 
-    # 获取出口IP
+    # 出口 IP
     current_ip = get_current_ip(PROXY_SERVER if IS_PROXY else None)
     log(f"🎯 当前出口IP: {current_ip}")
 
-    # 启动浏览器（只启动一次）
     with sync_playwright() as p:
+        browser = None
         try:
             log("🚀 启动浏览器...")
             browser = p.chromium.launch(
-                channel="chromium",   # 改为 chromium，确保在 Actions 中可用
                 headless=False,
-                args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+                args=[
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-infobars',
+                ]
             )
 
             all_success = True
+            total = len(accounts)
             for idx, acc in enumerate(accounts):
                 email = acc.get('email', '')
                 password = acc.get('password', '')
                 cookie = acc.get('cookie', '')
-                if not email:
-                    log(f"⚠️ 第 {idx+1} 个账号缺少 email，跳过")
+                identifier = email or f"账号{idx+1}"
+
+                # 只要有 cookie 或 email+password 就处理
+                if not cookie and not (email and password):
+                    log(f"⚠️ 第 {idx+1} 个账号缺少有效凭证，跳过")
                     continue
 
-                status, old_due, new_due = process_account(email, password, cookie, browser)
+                status, old_due, new_due = process_account(identifier, email, password, cookie, browser)
 
-                # 如果状态不是成功或未到时间，视为失败
                 if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
                     all_success = False
 
-                # 如果不是最后一个账号，等待3分钟
-                if idx < len(accounts) - 1:
-                    log(f"⏳ 等待 3 分钟后处理下一个账号...")
+                # 不是最后一个就等 3 分钟
+                if idx < total - 1:
+                    log("⏳ 等待 3 分钟后处理下一个账号...")
                     time.sleep(180)
 
-            # 最终退出码
             if all_success:
                 log("🎉 所有账号处理完毕（成功或未到期）")
                 sys.exit(0)
@@ -468,8 +595,12 @@ def main():
             log(f"❌ 浏览器启动或运行出错: {e}")
             sys.exit(1)
         finally:
-            if 'browser' in locals() and browser:
-                browser.close()
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
     main()
