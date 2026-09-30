@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, re, sys, time, random, requests, json
-from playwright.sync_api import sync_playwright
+from camoufox.sync_api import Camoufox
 
 COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""
 EMAIL        = os.environ.get('EMAIL') or ""
@@ -43,16 +43,9 @@ def mask_email(email):
     return email[:2] + '****'
 
 
-STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-window.chrome = { runtime: {} };
-"""
-
-
-def get_current_ip(proxy_server=None):
-    proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
+def get_current_ip():
     try:
-        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        resp = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=15)
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -125,12 +118,10 @@ def get_turnstile_token_len(page):
 
 
 def is_cf_challenge_page(page):
-    """判断当前页是否是 CF 挑战页（Just a moment...）"""
     try:
         title = page.title().lower()
         if "just a moment" in title or "checking your browser" in title:
             return True
-        # 检查是否有 CF 挑战标识
         if page.locator('#challenge-running, #challenge-stage, #cf-challenge-running').count() > 0:
             return True
     except Exception:
@@ -139,14 +130,9 @@ def is_cf_challenge_page(page):
 
 
 def wait_out_cf_challenge(page, max_wait=40):
-    """
-    如果当前是 CF 挑战页，等它自动通过。
-    不做任何鼠标操作，避免被判定 bot。
-    """
     if not is_cf_challenge_page(page):
         return True
-
-    log(f"⚠️ 检测到 CF 挑战页（Just a moment...），等待自动通过（最多 {max_wait} 秒）...")
+    log(f"⚠️ 检测到 CF 挑战页，等待自动通过（最多 {max_wait} 秒）...")
     start = time.time()
     while time.time() - start < max_wait:
         time.sleep(2)
@@ -157,34 +143,24 @@ def wait_out_cf_challenge(page, max_wait=40):
     return False
 
 
-def click_container_lightly(page, attempts=3):
-    """
-    轻量点击 CF 容器：最多点 3 次，每次间隔 3 秒。
-    不移动鼠标、不滚动，直接点击容器左侧坐标。
-    """
-    for i in range(attempts):
+def try_solve_turnstile(page, max_wait=30):
+    """等待 Turnstile token 生成（camoufox 通常能自动通过）"""
+    log(f"🔒 等待 Turnstile token（最多 {max_wait} 秒）...")
+    start = time.time()
+    last_check = 0
+    while time.time() - start < max_wait:
         tl = get_turnstile_token_len(page)
         if tl > 0:
-            log(f"✅ token 已生成（{tl}）")
+            elapsed = int(time.time() - start)
+            log(f"✅ token 已生成（长度 {tl}，用时 {elapsed} 秒）")
             return True
-
-        try:
-            container = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').first
-            if container.count() > 0:
-                box = container.bounding_box()
-                if box and box["width"] > 0:
-                    x = box["x"] + 28
-                    y = box["y"] + box["height"] / 2
-                    log(f"🖱️ 轻点容器 {i+1}/{attempts} ({x:.0f}, {y:.0f})")
-                    page.mouse.click(x, y)
-                    time.sleep(3)
-                    continue
-        except Exception:
-            pass
-        time.sleep(2)
-
+        elapsed = int(time.time() - start)
+        if elapsed - last_check >= 5:
+            log(f"🔍 已等 {elapsed} 秒，token={tl}")
+            last_check = elapsed
+        time.sleep(1)
     tl = get_turnstile_token_len(page)
-    log(f"🔍 轻点后 token={tl}")
+    log(f"⚠️ 等待结束，token={tl}")
     return tl > 0
 
 
@@ -203,8 +179,6 @@ def login(page, email, password, cookie_value):
                 'sameSite': 'Lax'
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            time.sleep(3)
-            # 检查是否被 CF 拦了
             wait_out_cf_challenge(page, max_wait=40)
             log(f"📝 当前Title: {page.title()}")
             if "auth/login" not in page.url and not is_cf_challenge_page(page):
@@ -289,7 +263,6 @@ def get_due_date(page, service_url):
 
 
 def click_create_invoice_with_retry(page, create_btn):
-    """4 种方式交替点击 Create Invoice"""
     state = {"posted": False, "status": 0, "location": ""}
 
     def on_response(resp):
@@ -314,8 +287,8 @@ def click_create_invoice_with_retry(page, create_btn):
 
     methods = [
         ("playwright-click", lambda: create_btn.click(timeout=5000)),
-        ("playwright-force", lambda: create_btn.click(timeout=5000, force=True)),
         ("js-click",         lambda: create_btn.evaluate("el => el.click()")),
+        ("playwright-force", lambda: create_btn.click(timeout=5000, force=True)),
         ("form-submit",      lambda: create_btn.evaluate("""
             el => {
                 const f = el.form || el.closest('form');
@@ -373,7 +346,6 @@ def find_invoice_urls_via_dom(page, url):
         return []
 
     time.sleep(3)
-    # 检查是否被 CF 拦
     if is_cf_challenge_page(page):
         log("⚠️ 被 CF 挑战页拦截，等待自动通过...")
         if not wait_out_cf_challenge(page, max_wait=40):
@@ -526,7 +498,6 @@ def click_renew_and_create(page, service_url, attempt=1):
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
-            # 如果被 CF 拦，等它过
             if is_cf_challenge_page(page):
                 if not wait_out_cf_challenge(page, max_wait=40):
                     log("❌ CF 挑战未过，跳过本轮")
@@ -580,9 +551,8 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # 轻量点击 CF 容器（最多 3 次），不阻断流程
-    log("🔒 轻量尝试 CF...")
-    click_container_lightly(page, attempts=3)
+    # camoufox 下 CF 通常自动过，这里等待 token
+    try_solve_turnstile(page, max_wait=30)
 
     try:
         page.screenshot(path=f"before_create_invoice_{attempt}.png", full_page=True)
@@ -689,15 +659,8 @@ def renew_service(page, service_url):
     return True
 
 
-def process_account(identifier, email, password, cookie_value, browser):
+def process_account(identifier, email, password, cookie_value, page):
     log(f"=== 开始处理账号: {mask_email(email) or identifier} ===")
-    context = browser.new_context(
-        viewport={'width': 1920, 'height': 1080},
-        user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        proxy={"server": PROXY_SERVER} if IS_PROXY else None
-    )
-    page = context.new_page()
-    page.add_init_script(STEALTH_JS)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
@@ -742,10 +705,6 @@ def process_account(identifier, email, password, cookie_value, browser):
             send_telegram_notification(status, old_due, new_due, email or identifier)
         except Exception as e:
             log(f"⚠️ 通知失败: {e}")
-        try:
-            context.close()
-        except Exception:
-            pass
 
 
 def main():
@@ -766,55 +725,65 @@ def main():
         accounts = [{"email": EMAIL, "password": PASSWORD, "cookie": COOKIE_VALUE}]
         log("📋 单账号模式")
 
-    current_ip = get_current_ip(PROXY_SERVER if IS_PROXY else None)
+    current_ip = get_current_ip()
     log(f"🎯 当前出口IP: {current_ip}")
 
-    with sync_playwright() as p:
-        browser = None
+    all_success = True
+    total = len(accounts)
+
+    for idx, acc in enumerate(accounts):
+        email = acc.get('email', '')
+        password = acc.get('password', '')
+        cookie = acc.get('cookie', '')
+        identifier = email or f"账号{idx+1}"
+
+        if not cookie and not (email and password):
+            log(f"⚠️ 第 {idx+1} 个账号缺少凭证，跳过")
+            continue
+
+        # camoufox 参数
+        camoufox_kwargs = {
+            "headless": False,
+            "humanize": True,
+            "os": ["windows"],
+            "locale": "en-US",
+        }
+        if IS_PROXY:
+            camoufox_kwargs["proxy"] = {"server": PROXY_SERVER}
+            camoufox_kwargs["geoip"] = True
+
+        log(f"🚀 启动 camoufox（账号 {idx+1}/{total}）...")
         try:
-            log("🚀 启动浏览器...")
-            browser = p.chromium.launch(
-                headless=False,
-                args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
-            )
-
-            all_success = True
-            total = len(accounts)
-            for idx, acc in enumerate(accounts):
-                email = acc.get('email', '')
-                password = acc.get('password', '')
-                cookie = acc.get('cookie', '')
-                identifier = email or f"账号{idx+1}"
-
-                if not cookie and not (email and password):
-                    log(f"⚠️ 第 {idx+1} 个账号缺少凭证，跳过")
-                    continue
-
-                status, old_due, new_due = process_account(identifier, email, password, cookie, browser)
-
-                if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
-                    all_success = False
-
-                if idx < total - 1:
-                    log("⏳ 等待 3 分钟...")
-                    time.sleep(180)
-
-            if all_success:
-                log("🎉 所有账号处理完毕")
-                sys.exit(0)
-            else:
-                log("⚠️ 部分账号处理失败")
-                sys.exit(1)
-
-        except Exception as e:
-            log(f"❌ 出错: {e}")
-            sys.exit(1)
-        finally:
-            if browser:
+            with Camoufox(**camoufox_kwargs) as browser:
+                page = browser.new_page()
+                status, old_due, new_due = process_account(identifier, email, password, cookie, page)
                 try:
                     browser.close()
                 except Exception:
                     pass
+        except Exception as e:
+            log(f"❌ camoufox 启动/运行失败: {e}")
+            status = f"❌ camoufox 异常: {e}"
+            all_success = False
+            try:
+                send_telegram_notification(status, "未知", "未知", email or identifier)
+            except Exception:
+                pass
+            continue
+
+        if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
+            all_success = False
+
+        if idx < total - 1:
+            log("⏳ 等待 3 分钟...")
+            time.sleep(180)
+
+    if all_success:
+        log("🎉 所有账号处理完毕")
+        sys.exit(0)
+    else:
+        log("⚠️ 部分账号处理失败")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
