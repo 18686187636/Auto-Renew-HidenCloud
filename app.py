@@ -22,8 +22,8 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF   = 20
-CF_IFRAME_WAIT_SECONDS  = 30
-CF_TURNSTILE_TIMEOUT    = 30
+CF_IFRAME_WAIT_SECONDS  = 10     # 缩短：这个站点主要靠 .cf-turnstile div
+CF_TURNSTILE_TIMEOUT    = 40
 NAV_POLL_SECONDS        = 60
 WAIT_AFTER_PAY          = 15
 ACCOUNT_INTERVAL_SEC    = 90
@@ -33,6 +33,7 @@ CF_IFRAME_SEL = (
     'iframe[title*="cloudflare"], '
     'iframe[src*="turnstile"]'
 )
+CF_DIV_SEL = '.cf-turnstile, div[class*="cf-turnstile"], div[id*="cf-chl-widget"]'
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -122,7 +123,6 @@ def mouse_click_element(page, locator, label=""):
 
 
 def click_with_fallback(page, locator, label=""):
-    """原生 click → JS click → 物理点击。"""
     try:
         locator.scroll_into_view_if_needed()
         locator.click(timeout=5000)
@@ -145,10 +145,50 @@ def click_with_fallback(page, locator, label=""):
     return False
 
 
+# ---------- Accept 按钮 ----------
+
+def click_accept_if_present(page):
+    """
+    点击弹窗/页面里可能出现的 Accept 按钮。
+    只在元素可见且 enabled 时才点，避免误触其它 "Accept" 文本。
+    """
+    selectors = [
+        'button:has-text("Accept All")',
+        'button:has-text("Accept")',
+        'button:has-text("I Accept")',
+        'button:has-text("I agree")',
+        'button:has-text("Agree")',
+        'button:has-text("Allow")',
+        'button:has-text("同意")',
+        'button:has-text("接受")',
+        '[role="dialog"] button:has-text("Accept")',
+        '.fc-cta-consent',
+        '.fc-button-label',
+    ]
+    for sel in selectors:
+        try:
+            btns = page.locator(sel)
+            n = btns.count()
+            for i in range(n):
+                btn = btns.nth(i)
+                try:
+                    if not btn.is_visible() or not btn.is_enabled():
+                        continue
+                    text = (btn.inner_text() or "").strip()
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=3000)
+                    log(f"✅ 点击 Accept 按钮: {sel} text={text!r}")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
 # ---------- Cloudflare 处理 ----------
 
 def wait_cf_iframe(page, timeout=CF_IFRAME_WAIT_SECONDS):
-    """显式等待 CF iframe 出现。True=出现，False=超时未出现。"""
     try:
         page.wait_for_selector(CF_IFRAME_SEL, timeout=timeout * 1000)
         return True
@@ -156,17 +196,179 @@ def wait_cf_iframe(page, timeout=CF_IFRAME_WAIT_SECONDS):
         return False
 
 
+def _turnstile_token_ready(page):
+    """检查 Turnstile 响应 token 是否已生成。"""
+    try:
+        val = page.evaluate("""() => {
+            const sels = [
+                'input[name="cf-turnstile-response"]',
+                'input[id^="cf-chl-widget-"][id$="_response"]',
+                'textarea[name="cf-turnstile-response"]',
+            ];
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (el && el.value && el.value.length > 20) return el.value.slice(0, 40);
+            }
+            return null;
+        }""")
+        return bool(val)
+    except Exception:
+        return False
+
+
+def _js_click_turnstile_shadow(page):
+    """
+    穿透 shadow DOM 找 Turnstile checkbox 并点击。
+    Turnstile 结构通常是 <div class="cf-turnstile">...<input type="checkbox">...
+    但 checkbox 可能存在于嵌套 shadow root 中。
+    """
+    try:
+        return page.evaluate("""() => {
+            const tryClick = (el) => {
+                if (!el) return false;
+                try {
+                    el.scrollIntoView({block:'center', inline:'center'});
+                    el.click();
+                    return true;
+                } catch(e) { return false; }
+            };
+
+            const walk = (root, out) => {
+                let n;
+                try {
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    n = walker.currentNode;
+                    while (n) {
+                        out.push(n);
+                        if (n.shadowRoot) walk(n.shadowRoot, out);
+                        n = walker.nextNode();
+                    }
+                } catch(e) {}
+                return out;
+            };
+
+            const all = walk(document.body, []);
+            const hits = [];
+
+            for (const el of all) {
+                const tag = (el.tagName || '').toLowerCase();
+                const cls = (el.className && el.className.toString) ? el.className.toString() : '';
+                const id  = el.id || '';
+                const role = el.getAttribute ? (el.getAttribute('role') || '') : '';
+                const type = el.getAttribute ? (el.getAttribute('type') || '') : '';
+
+                // Turnstile checkbox 特征
+                const isTSCheckbox =
+                    (tag === 'input' && type === 'checkbox') ||
+                    role === 'checkbox' ||
+                    cls.includes('cb-i') ||
+                    cls.includes('cb-l') ||
+                    (cls.includes('turnstile') && (tag === 'input' || tag === 'label'));
+
+                // 必须位于 .cf-turnstile 或 #cf-chl-widget-* 容器内
+                let inCfWidget = false;
+                let p = el;
+                while (p) {
+                    const pcls = (p.className && p.className.toString) ? p.className.toString() : '';
+                    const pid  = p.id || '';
+                    if (pcls.includes('cf-turnstile') || pid.startsWith('cf-chl-widget')) {
+                        inCfWidget = true;
+                        break;
+                    }
+                    p = p.parentElement || (p.getRootNode && p.getRootNode().host) || null;
+                }
+
+                if (isTSCheckbox && inCfWidget) {
+                    hits.push({tag, id, cls: cls.slice(0, 60), role, type});
+                    if (tryClick(el)) {
+                        return {clicked: true, tag, id, cls: cls.slice(0, 60), role, type};
+                    }
+                }
+            }
+
+            return {clicked: false, hits: hits.slice(0, 10)};
+        }""")
+    except Exception as e:
+        log(f"⚠️ JS 穿透点击异常: {e}")
+        return None
+
+
+def click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
+    """
+    点击 Turnstile 小方框：
+      1) 优先 JS 穿透 shadow DOM
+      2) 检查响应 token
+      3) 兜底坐标点击 .cf-turnstile 区域左侧
+    """
+    log("🔒 开始点击 Turnstile checkbox...")
+    start = time.time()
+    attempt = 0
+
+    while time.time() - start < timeout:
+        attempt += 1
+        log(f"🔁 第 {attempt} 次尝试 (已用 {int(time.time()-start)}s)")
+
+        # 1) JS 穿透点击
+        res = _js_click_turnstile_shadow(page)
+        if res:
+            if res.get("clicked"):
+                log(f"✅ JS 穿透点击成功: {res}")
+            else:
+                hits = res.get("hits") or []
+                if hits:
+                    log(f"🔍 找到候选元素但点击失败: {hits}")
+                else:
+                    log("ℹ️ JS 未找到 Turnstile checkbox 候选")
+
+        time.sleep(3)
+
+        # 2) 检查 token
+        if _turnstile_token_ready(page):
+            log("✅ Turnstile token 已生成，验证通过")
+            return True
+
+        # 3) 检查容器是否消失
+        try:
+            if page.locator(CF_DIV_SEL).count() == 0:
+                log("✅ .cf-turnstile 容器已消失")
+                return True
+        except Exception:
+            pass
+
+        # 4) 兜底：坐标点击 .cf-turnstile 左侧
+        try:
+            loc = page.locator(CF_DIV_SEL).first
+            if loc.count() > 0:
+                box = loc.bounding_box()
+                if box:
+                    x = box["x"] + 25
+                    y = box["y"] + box["height"] / 2
+                    log(f"🖱️ 坐标点击 .cf-turnstile ({x:.0f}, {y:.0f})")
+                    page.mouse.move(x - 60, y - 30)
+                    time.sleep(0.3)
+                    page.mouse.move(x, y)
+                    time.sleep(0.15)
+                    page.mouse.click(x, y)
+                    time.sleep(3)
+                    if _turnstile_token_ready(page):
+                        log("✅ 坐标点击后 token 已生成")
+                        return True
+        except Exception as e:
+            log(f"⚠️ 坐标点击异常: {e}")
+
+        time.sleep(2)
+
+    log("⚠️ Turnstile 点击超时")
+    return False
+
+
 def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
-    """
-    优先用 JS 在 Turnstile iframe 内点击 checkbox；
-    失败则回退到坐标点击。
-    返回 True 表示 iframe 消失（验证通过）。
-    """
-    log("🔒 尝试 JS 点击 Turnstile checkbox...")
+    """兼容旧调用：处理 CF iframe 场景。"""
+    log("🔒 尝试在 CF iframe 内点击...")
     start = time.time()
     while time.time() - start < timeout:
         if page.locator(CF_IFRAME_SEL).count() == 0:
-            log("✅ CF iframe 已消失，验证通过")
+            log("✅ CF iframe 已消失")
             return True
 
         for f in page.frames:
@@ -174,60 +376,30 @@ def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
             if "challenges.cloudflare.com" in furl or "turnstile" in furl:
                 try:
                     clicked = f.evaluate("""() => {
-                        const sels = [
-                            'input[type="checkbox"]',
-                            '[role="checkbox"]',
-                            'label',
-                            '#challenge-stage',
-                            'span.cb-i',
-                        ];
+                        const sels = ['input[type="checkbox"]','[role="checkbox"]','label','#challenge-stage','span.cb-i'];
                         for (const s of sels) {
                             const el = document.querySelector(s);
-                            if (el) {
-                                try { el.scrollIntoView({block:'center'}); } catch(e) {}
-                                el.click();
-                                return s;
-                            }
+                            if (el) { try { el.scrollIntoView({block:'center'}); } catch(e){} el.click(); return s; }
                         }
                         return null;
                     }""")
                     if clicked:
-                        log(f"✅ JS 点击 Turnstile 元素: {clicked}")
+                        log(f"✅ iframe 内 JS 点击: {clicked}")
                         time.sleep(3)
                         if page.locator(CF_IFRAME_SEL).count() == 0:
-                            log("✅ CF 验证通过")
                             return True
                 except Exception as e:
                     log(f"⚠️ frame JS 点击失败: {e}")
-
-        try:
-            box = page.locator(CF_IFRAME_SEL).first.bounding_box()
-            if box:
-                x = box["x"] + 30
-                y = box["y"] + box["height"] / 2
-                log(f"🖱️ 兜底坐标点击 CF ({x:.0f}, {y:.0f})")
-                page.mouse.move(x - 60, y - 30)
-                time.sleep(0.3)
-                page.mouse.move(x, y)
-                time.sleep(0.15)
-                page.mouse.click(x, y)
-                time.sleep(3)
-                if page.locator(CF_IFRAME_SEL).count() == 0:
-                    log("✅ CF 验证通过")
-                    return True
-        except Exception:
-            pass
-
         time.sleep(2)
-
-    log("⚠️ CF 处理超时，未确认通过")
     return False
 
 
 def handle_cloudflare(page):
-    if page.locator(CF_IFRAME_SEL).count() == 0:
+    if page.locator(CF_IFRAME_SEL).count() == 0 and page.locator(CF_DIV_SEL).count() == 0:
         return True
     log("⚠️ 页面检测到 Cloudflare 验证...")
+    if page.locator(CF_DIV_SEL).count() > 0:
+        return click_turnstile_checkbox(page, timeout=60)
     return js_click_turnstile(page, timeout=60)
 
 
@@ -569,29 +741,56 @@ def renew_service(page, service_url, tag="acc"):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # === 弹窗内 CF：优先 JS 点击 ===
-    log("🔒 检查弹窗内 CF iframe...")
-    if wait_cf_iframe(page, timeout=CF_IFRAME_WAIT_SECONDS):
-        log("⚠️ 检测到 CF iframe，开始 JS 点击")
+    # === 先点 Accept 按钮（如果有）===
+    log("🔍 查找 Accept 按钮...")
+    if click_accept_if_present(page):
+        time.sleep(2)
+    else:
+        log("ℹ️ 未找到 Accept 按钮")
+
+    # === 检测 CF：优先 .cf-turnstile div，其次 iframe ===
+    log("🔒 检查弹窗内 CF...")
+    has_div = False
+    has_iframe = False
+    try:
+        has_div = page.locator(CF_DIV_SEL).count() > 0
+    except Exception:
+        pass
+    try:
+        has_iframe = page.locator(CF_IFRAME_SEL).count() > 0
+    except Exception:
+        pass
+
+    if has_div:
+        log("⚠️ 检测到 .cf-turnstile 容器，开始点击 checkbox")
+        click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
+    elif has_iframe:
+        log("⚠️ 检测到 CF iframe，开始点击")
+        js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT)
+    elif wait_cf_iframe(page, timeout=CF_IFRAME_WAIT_SECONDS):
+        log("⚠️ 等待期内出现 CF iframe，开始点击")
         js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT)
     else:
-        log("ℹ️ 等待期内未出现 CF iframe，继续")
+        log("ℹ️ 未检测到 CF")
+
+    # 再次检查 token 状态
+    if _turnstile_token_ready(page):
+        log("✅ 点击前确认 Turnstile token 已生成")
+    else:
+        log("⚠️ 点击前 Turnstile token 仍未生成")
 
     log(f"🔍 点击前 URL: {page.url}")
 
-    # === 点击 Create Invoice 前截图（全页 + 视口 + 弹窗）===
+    # === 点击 Create Invoice 前截图 ===
     try:
-        # 1) 全页截图
         page.screenshot(path=f"before_create_invoice_{tag}.png", full_page=True)
         with open(f"before_create_invoice_{tag}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
         log("📸 已保存全页截图 before_create_invoice")
 
-        # 2) 视口截图（弹窗更清晰）
         page.screenshot(path=f"before_click_viewport_{tag}.png", full_page=False)
         log("📸 已保存视口截图 before_click_viewport")
 
-        # 3) 弹窗区域截图
         modal_saved = False
         for msel in ['[role="dialog"]', '.modal', '.fixed.inset-0', 'div[class*="modal"]']:
             try:
@@ -606,13 +805,11 @@ def renew_service(page, service_url, tag="acc"):
         if not modal_saved:
             log("ℹ️ 未定位到弹窗元素，跳过弹窗截图")
 
-        # 4) 按钮状态
         try:
             log(f"🔍 create_btn visible={create_btn.is_visible()}, enabled={create_btn.is_enabled()}")
         except Exception:
             pass
 
-        # 5) 列出页面 iframe，确认 CF 是否真的存在
         try:
             iframes = page.locator('iframe')
             n_if = iframes.count()
@@ -627,7 +824,6 @@ def renew_service(page, service_url, tag="acc"):
         except Exception as e:
             log(f"⚠️ 枚举 iframe 失败: {e}")
 
-        # 6) 检查 shadow DOM 里的 turnstile 痕迹
         try:
             cf_hint = page.evaluate("""() => {
                 const hits = [];
@@ -700,6 +896,28 @@ def renew_service(page, service_url, tag="acc"):
                 break
     except Exception:
         pass
+
+    # 若报 captcha 且弹窗仍在，再补一次 CF 处理 + 重试点击
+    if modal_still_open:
+        try:
+            body_lower = page.locator("body").inner_text().lower()
+        except Exception:
+            body_lower = ""
+        if "captcha" in body_lower or "verification" in body_lower:
+            log("🔁 检测到 captcha 错误，再次尝试 CF + 重试点击...")
+            click_accept_if_present(page)
+            time.sleep(1)
+            if page.locator(CF_DIV_SEL).count() > 0:
+                click_turnstile_checkbox(page, timeout=30)
+            elif page.locator(CF_IFRAME_SEL).count() > 0:
+                js_click_turnstile(page, timeout=30)
+            time.sleep(2)
+            try:
+                create_btn.click(timeout=5000)
+                log("✅ 重试点击 Create Invoice")
+            except Exception as e:
+                log(f"⚠️ 重试点击失败: {e}")
+            time.sleep(3)
 
     time.sleep(2)
     for status, url in net_log:
