@@ -23,6 +23,7 @@ UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF = 10
 CF_TURNSTILE_TIMEOUT  = 90
+CF_JS_CHALLENGE_WAIT  = 35
 NAV_POLL_SECONDS      = 30
 WAIT_AFTER_PAY        = 15
 PAGE_LOAD_TIMEOUT     = 60000
@@ -41,7 +42,6 @@ RENEW_BTN_SELECTORS = [
     'button[type="submit"]:has-text("Renew")',
 ]
 
-# 与运行环境一致的 Linux UA（之前 5m 13s 日志里正常加载时用的就是这个）
 DEFAULT_UA = (
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
@@ -144,7 +144,7 @@ def send_telegram_notification(status, old_due, new_due, email):
         f"{status}\n"
         f"👤 账号: {mask_email(email)}\n"
         f"📅 续期前到期：{old_due}\n"
-        f"📅 续期后到期：{new_due}\n"
+        f"📅 续费后到期：{new_due}\n"
         f"🕒 续期时间：{now}"
     )
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -174,7 +174,6 @@ def save_debug(page, name):
 
 
 def log_page_state(page, tag=""):
-    """打印当前页面的关键诊断信息"""
     try:
         url = page.url
     except Exception:
@@ -192,6 +191,57 @@ def log_page_state(page, tag=""):
     log(f"🔎 [{tag}] Title={title!r}, body_len={len(body_text)}")
     log(f"🔎 [{tag}] body_preview={preview!r}")
     return body_text
+
+
+def wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT):
+    """
+    等待 Cloudflare 'Just a moment...' JS Challenge 完成。
+    JS challenge 通常几秒到 30 秒内会自动跳转，检测 title 变化 + cf_clearance cookie。
+    """
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            title = page.title() or ""
+        except Exception:
+            title = ""
+        title_low = title.lower()
+
+        # title 已切换说明过了
+        if "just a moment" not in title_low and "attention required" not in title_low:
+            log(f"✅ CF JS Challenge 通过 (title={title!r}, 耗时 {time.time()-start:.1f}s)")
+            return True
+
+        # 检测 cf_clearance cookie
+        try:
+            cookies = page.context.cookies()
+            has_clearance = any(c.get("name") == "cf_clearance" for c in cookies)
+            if has_clearance and "just a moment" not in title_low:
+                log("✅ 检测到 cf_clearance 且 title 已变")
+                return True
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    log(f"⚠️ CF JS Challenge 未在 {max_wait}s 内完成")
+    return False
+
+
+def _looks_like_cf_js_challenge(page):
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    if "just a moment" in title or "attention required" in title:
+        return True
+    try:
+        body = page.locator("body").inner_text().lower()
+    except Exception:
+        body = ""
+    hints = ("security verification", "verifying your browser",
+             "checking your browser", "enable javascript and cookies",
+             "analyzing connection", "validating security", "preparing access")
+    return any(h in body for h in hints) and len(body) < 2000
 
 
 def human_mouse_warmup(page):
@@ -456,12 +506,18 @@ def close_cookie_consent(page):
         pass
 
 
-def goto_and_settle(page, url, timeout=PAGE_LOAD_TIMEOUT):
+def goto_and_settle(page, url, timeout=PAGE_LOAD_TIMEOUT, wait_cf=True):
+    """goto 后等 CF JS challenge + networkidle + Turnstile"""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
     except Exception as e:
         log(f"⚠️ goto {url} 失败: {e}")
         return False
+
+    if wait_cf and _looks_like_cf_js_challenge(page):
+        log("⚠️ 检测到 CF JS Challenge，等待其完成...")
+        wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
+
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
@@ -487,6 +543,9 @@ def login(page, email, password, cookie_value):
                 'sameSite': 'Lax'
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            if _looks_like_cf_js_challenge(page):
+                log("⚠️ dashboard 页出现 CF JS Challenge，等待...")
+                wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
             handle_cloudflare(page)
             log(f"📝 当前Title: {page.title()}")
             if "auth/login" not in page.url:
@@ -506,6 +565,8 @@ def login(page, email, password, cookie_value):
         except Exception:
             pass
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+        if _looks_like_cf_js_challenge(page):
+            wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
         handle_cloudflare(page)
         page.fill('input[name="email"]', email)
         page.fill('input[name="password"]', password)
@@ -516,6 +577,8 @@ def login(page, email, password, cookie_value):
         handle_cloudflare(page)
         page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+        if _looks_like_cf_js_challenge(page):
+            wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
         handle_cloudflare(page)
         if "auth/login" in page.url:
             return False
@@ -542,41 +605,108 @@ def get_server_id(page):
         return None
 
 
+def try_enter_service_via_dashboard(page, server_id, service_url):
+    """
+    优先从 dashboard 点击链接进入 service 页（站内导航 CF 更友好）。
+    失败则退回直接 goto。
+    """
+    log(f"🚶 尝试从 dashboard 站内进入 service/{server_id}/manage")
+    try:
+        # 1. 确保在 dashboard
+        if "/dashboard" not in page.url:
+            try:
+                page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded",
+                          timeout=PAGE_LOAD_TIMEOUT)
+                if _looks_like_cf_js_challenge(page):
+                    wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
+                handle_cloudflare(page)
+                close_cookie_consent(page)
+                time.sleep(2)
+            except Exception as e:
+                log(f"⚠️ 回到 dashboard 失败: {e}")
+
+        # 2. 找 service 链接
+        selectors = [
+            f'a[href*="/service/{server_id}/manage"]',
+            f'a[href$="/service/{server_id}/manage"]',
+            f'a[href*="/service/{server_id}"]',
+        ]
+        target = None
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    target = loc.first
+                    log(f"✅ 找到 service 链接: {sel} (count={loc.count()})")
+                    break
+            except Exception:
+                continue
+
+        if target is None:
+            log("⚠️ dashboard 上没有 service 链接，直接 goto service 页")
+            goto_and_settle(page, service_url)
+            return True
+
+        # 3. 点击
+        try:
+            target.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            target.click(timeout=8000)
+        except Exception:
+            # 兜底：evaluate 点击
+            try:
+                target.evaluate("el => el.click()")
+            except Exception as e:
+                log(f"⚠️ 点击 service 链接失败: {e}，退回 goto")
+                goto_and_settle(page, service_url)
+                return True
+
+        time.sleep(3)
+
+        # 4. 处理 CF JS challenge（如果点击后触发）
+        if _looks_like_cf_js_challenge(page):
+            log("⚠️ 站内点击后触发 CF JS Challenge，等待...")
+            wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        handle_cloudflare(page)
+        close_cookie_consent(page)
+        return True
+
+    except Exception as e:
+        log(f"⚠️ 站内进入 service 页异常: {e}，退回 goto")
+        goto_and_settle(page, service_url)
+        return True
+
+
 DATE_PATTERN = re.compile(
     r"Due date\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}|\d{4}-\d{2}-\d{2})",
     re.IGNORECASE | re.DOTALL
 )
 
-CF_CHALLENGE_HINTS = ("just a moment", "checking your browser",
-                      "cf-browser-verification", "enable javascript and cookies",
-                      "attention required")
-
-
-def _looks_like_cf_challenge(body_text):
-    low = body_text.lower()
-    return any(k in low for k in CF_CHALLENGE_HINTS)
-
 
 def get_due_date(page, service_url, retries=3):
-    """
-    打开 service 页，等待真正渲染出 Due date / Renew。
-    若页面过短或疑似 CF 挑战，则等待更久后重试。
-    """
+    """打开 service 页并获取 Due Date。"""
     for attempt in range(retries):
         try:
             if attempt == 0:
                 if service_url not in page.url:
                     goto_and_settle(page, service_url)
-                else:
-                    handle_cloudflare(page)
-                    close_cookie_consent(page)
             else:
                 log(f"🔄 第 {attempt+1} 次尝试获取 Due Date")
+                # 后续重试：用站内刷新 + 等待 CF
                 try:
                     page.goto(service_url, wait_until="domcontentloaded",
                               timeout=PAGE_LOAD_TIMEOUT)
                 except Exception:
                     pass
+                if _looks_like_cf_js_challenge(page):
+                    wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
                 try:
                     page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
@@ -584,19 +714,21 @@ def get_due_date(page, service_url, retries=3):
                 handle_cloudflare(page)
                 close_cookie_consent(page)
 
-            # 轮询等待页面渲染
+            # 轮询等待页面渲染（最多 25 秒）
             body_text = ""
-            for _ in range(30):  # 最多 30 秒
+            for _ in range(25):
                 try:
                     body_text = page.locator("body").inner_text()
                 except Exception:
                     body_text = ""
-                if ("Due date" in body_text) or ("Renew" in body_text and len(body_text) > 2000):
-                    break
-                # 若页面很短且疑似 CF 挑战，等一下再检查
-                if len(body_text) < 1000 and _looks_like_cf_challenge(body_text):
+
+                # 先看是否是 CF challenge
+                if _looks_like_cf_js_challenge(page):
                     time.sleep(2)
                     continue
+
+                if ("Due date" in body_text) or ("Renew" in body_text and len(body_text) > 2000):
+                    break
                 time.sleep(1)
 
             log_page_state(page, f"due_attempt{attempt+1}")
@@ -609,10 +741,6 @@ def get_due_date(page, service_url, retries=3):
 
             hits = re.findall(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}", body_text)
             log(f"🔍 第 {attempt+1} 次：日期样式文本 {hits[:8]}，body_len={len(body_text)}")
-
-            if _looks_like_cf_challenge(body_text):
-                log(f"⚠️ 疑似 CF 挑战页，等待 8 秒后重试")
-                time.sleep(8)
 
         except Exception as e:
             log(f"❌ 获取Due Date 第 {attempt+1} 次失败: {e}")
@@ -630,6 +758,8 @@ def get_unpaid_invoice_urls(page):
         log(f"⚠️ 导航未付发票页失败: {e}")
         return []
 
+    if _looks_like_cf_js_challenge(page):
+        wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
     handle_cloudflare(page)
     close_cookie_consent(page)
     time.sleep(3)
@@ -694,6 +824,8 @@ def try_pay_invoice(page, invoice_url):
         log(f"⚠️ 导航失败: {e}")
         return False
 
+    if _looks_like_cf_js_challenge(page):
+        wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
     handle_cloudflare(page)
     close_cookie_consent(page)
     time.sleep(2)
@@ -788,6 +920,8 @@ def try_open_renew_modal(page, create_btn, service_url):
         save_debug(page, "renew_not_found")
         try:
             page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            if _looks_like_cf_js_challenge(page):
+                wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
             handle_cloudflare(page)
             close_cookie_consent(page)
             time.sleep(3)
@@ -860,6 +994,8 @@ def renew_service(page, service_url):
             log(f"🔁 第 {round_idx+1} 轮：刷新服务页后重新打开 Renew 弹窗")
             try:
                 page.goto(service_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                if _looks_like_cf_js_challenge(page):
+                    wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
                 try:
                     page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
@@ -998,6 +1134,8 @@ def renew_service(page, service_url):
         time.sleep(3)
         try:
             page.goto(service_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            if _looks_like_cf_js_challenge(page):
+                wait_cf_js_challenge(page, max_wait=CF_JS_CHALLENGE_WAIT)
             handle_cloudflare(page)
             close_cookie_consent(page)
         except Exception as e:
@@ -1034,6 +1172,10 @@ def process_account(identifier, email, password, cookie_value, browser):
             status = "❌ 获取Server ID失败"
             return (status, old_due, new_due)
         service_url = f"{BASE_URL}/service/{server_id}/manage"
+
+        # 优先从 dashboard 站内点击进入 service 页
+        try_enter_service_via_dashboard(page, server_id, service_url)
+        time.sleep(2)
 
         old_due = get_due_date(page, service_url)
         log(f"📆 续费前到期时间：{old_due}")
@@ -1096,7 +1238,6 @@ def main():
         browser = None
         try:
             log("🚀 启动浏览器...")
-            # 回退到默认 Chromium（之前 5m 13s 日志里能正常加载 service 页）
             browser = p.chromium.launch(
                 headless=False,
                 args=[
@@ -1106,6 +1247,8 @@ def main():
                     '--disable-dev-shm-usage',
                     '--window-size=1920,1080',
                     '--lang=en-US',
+                    '--disable-background-networking',
+                    '--disable-sync',
                 ]
             )
 
