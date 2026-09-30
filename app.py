@@ -21,12 +21,15 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
-WAIT_RENDER_BEFORE_CF   = 5
-CF_IFRAME_WAIT_SECONDS  = 15
+# ==== 本次改动 ====
+WAIT_RENDER_BEFORE_CF   = 20   # 原 5，弹窗渲染等待
+CF_IFRAME_WAIT_SECONDS  = 30   # 原 15，CF iframe 等待
+# ==================
+
 CF_TURNSTILE_TIMEOUT    = 30
 NAV_POLL_SECONDS        = 60
 WAIT_AFTER_PAY          = 15
-ACCOUNT_INTERVAL_SEC    = 90   # 多账号间隔，原来是 180，改小避免工作流超时
+ACCOUNT_INTERVAL_SEC    = 90
 
 CF_IFRAME_SEL = (
     'iframe[src*="challenges.cloudflare.com"], '
@@ -165,12 +168,10 @@ def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
     log("🔒 尝试 JS 点击 Turnstile checkbox...")
     start = time.time()
     while time.time() - start < timeout:
-        # iframe 已消失 = 通过
         if page.locator(CF_IFRAME_SEL).count() == 0:
             log("✅ CF iframe 已消失，验证通过")
             return True
 
-        # 遍历所有 frame，定位 turnstile frame 并 JS 点击
         for f in page.frames:
             furl = f.url or ""
             if "challenges.cloudflare.com" in furl or "turnstile" in furl:
@@ -202,7 +203,6 @@ def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
                 except Exception as e:
                     log(f"⚠️ frame JS 点击失败: {e}")
 
-        # 兜底：主页面坐标点击
         try:
             box = page.locator(CF_IFRAME_SEL).first.bounding_box()
             if box:
@@ -228,7 +228,6 @@ def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
 
 
 def handle_cloudflare(page):
-    """页面级 CF 检查：出现 iframe 就处理，否则直接返回。"""
     if page.locator(CF_IFRAME_SEL).count() == 0:
         return True
     log("⚠️ 页面检测到 Cloudflare 验证...")
@@ -378,7 +377,6 @@ def get_unpaid_invoice_urls(page, tag="acc"):
 
     urls = []
 
-    # 1) 只从含发票链接的表格行提取
     try:
         rows = page.locator('tr').filter(
             has=page.locator('a[href*="/payment/invoice/"]')
@@ -399,7 +397,6 @@ def get_unpaid_invoice_urls(page, tag="acc"):
     except Exception as e:
         log(f"⚠️ 定位发票行失败: {e}")
 
-    # 2) 兜底：从 HTML 抓所有发票链接（兼容单/双引号、任意属性顺序）
     if not urls:
         html = page.content()
         found = re.findall(
@@ -421,7 +418,6 @@ def has_real_pay_button(page):
     try:
         if page.locator('form[action*="/payment/invoice/"][action$="/pay"] button[type="submit"]').count() > 0:
             return True
-        # 放宽：含 pay 的绿色按钮
         btns = page.locator('button')
         for i in range(min(btns.count(), 30)):
             try:
@@ -436,12 +432,6 @@ def has_real_pay_button(page):
 
 
 def try_pay_invoice(page, invoice_url, tag="acc"):
-    """
-    返回：
-      True  → 支付成功
-      False → 不是真发票页（跳过）
-      None  → 是真发票页但支付失败
-    """
     log(f"🔗 访问: {invoice_url}")
     try:
         if page.url != invoice_url:
@@ -469,7 +459,6 @@ def try_pay_invoice(page, invoice_url, tag="acc"):
     except Exception:
         pass
 
-    # 找 Pay 按钮
     candidates = []
     try:
         cand1 = page.locator('form[action*="/payment/invoice/"][action$="/pay"] button[type="submit"]')
@@ -600,7 +589,6 @@ def renew_service(page, service_url, tag="acc"):
     except Exception:
         pass
 
-    # === 监听网络响应 ===
     net_log = []
     def _on_response(resp):
         try:
@@ -614,13 +602,11 @@ def renew_service(page, service_url, tag="acc"):
     except Exception:
         pass
 
-    # === 点击 Create Invoice：原生 → JS → 物理 ===
     log("🖱️ 点击 'Create Invoice'...")
     if not click_with_fallback(page, create_btn, "Create Invoice"):
         log("❌ 点击 Create Invoice 失败")
         return False
 
-    # 点击后等 3 秒，检查弹窗状态与错误提示
     time.sleep(3)
 
     modal_still_open = False
@@ -639,14 +625,12 @@ def renew_service(page, service_url, tag="acc"):
     except Exception:
         pass
 
-    # 网络日志
     time.sleep(2)
     for status, url in net_log:
         log(f"📡 请求: {status} {url}")
     if any(s >= 400 for s, _ in net_log):
         log("⚠️ 存在 4xx/5xx 响应，后端可能拒绝了请求")
 
-    # === 短轮询：看是否自动跳转 ===
     log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
     auto_url = None
     for i in range(NAV_POLL_SECONDS):
@@ -672,7 +656,6 @@ def renew_service(page, service_url, tag="acc"):
     except Exception:
         pass
 
-    # === 支付处理 ===
     paid_ok = False
 
     if auto_url:
@@ -682,7 +665,6 @@ def renew_service(page, service_url, tag="acc"):
             paid_ok = True
 
     if not paid_ok:
-        # 重试几次抓未付发票（后端有时慢）
         unpaid_urls = []
         for attempt in range(3):
             log(f"⏳ 第 {attempt+1}/3 次抓取未付发票（间隔 10 秒）...")
