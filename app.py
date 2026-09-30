@@ -88,7 +88,6 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 def mouse_click_element(page, locator, label=""):
-    """用物理鼠标点击元素中心"""
     try:
         box = locator.bounding_box()
         if not box:
@@ -280,12 +279,24 @@ def get_due_date(page, service_url):
     return "未知"
 
 
-def find_latest_unpaid_invoice(page):
+def extract_invoice_ids(html):
+    """从 HTML 中按出现顺序提取发票 UUID（去重）"""
+    ids = re.findall(r'/payment/invoice/([a-f0-9\-]{20,})', html)
+    seen = set()
+    ordered = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            ordered.append(i)
+    return ordered
+
+
+def find_new_unpaid_invoice(page, existing_ids):
     """
-    在 /invoices 列表页找最新的未付发票 URL。
-    策略：优先找带 'Unpaid' 状态的卡片，否则取第一个发票链接。
+    访问 /invoices，找不在 existing_ids 里的发票（即新生成的）。
+    返回发票 URL 或 None。
     """
-    log("🔍 访问 /invoices 列表页查找最新未付发票...")
+    log("🔍 访问 /invoices 查找新生成的发票...")
     try:
         page.goto(f"{BASE_URL}/invoices", wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
@@ -296,64 +307,83 @@ def find_latest_unpaid_invoice(page):
     close_cookie_consent(page)
     time.sleep(3)
 
-    log(f"📝 /invoices 页面 Title: {page.title()}, URL: {page.url}")
+    log(f"📝 /invoices Title: {page.title()}, URL: {page.url}")
     try:
         page.screenshot(path="invoices_list.png", full_page=True)
         with open("invoices_list.html", "w", encoding="utf-8") as f:
             f.write(page.content())
-        log("📸 已保存 /invoices 页面")
     except Exception:
         pass
 
-    # 从 /invoices 页面找未付发票
-    try:
-        # 先找所有行/卡片里含 "Unpaid" 的，提取其链接
-        unpaid_rows = page.locator('tr:has-text("Unpaid"), div:has-text("Unpaid") a[href*="/payment/invoice/"]')
-        cnt = unpaid_rows.count()
-        log(f"🔍 未付发票候选数: {cnt}")
-
-        if cnt > 0:
-            # 第一个就是最新的
-            href = unpaid_rows.first.get_attribute("href")
-            if href:
-                if not href.startswith("http"):
-                    href = BASE_URL + href
-                log(f"✅ 找到未付发票: {href}")
-                return href
-    except Exception as e:
-        log(f"⚠️ 定位未付发票失败: {e}")
-
-    # 兜底：从页面所有链接里提取第一个 /payment/invoice/{uuid}
     html = page.content()
-    urls = re.findall(r'href="(https?://dash\.hidencloud\.com/payment/invoice/[a-f0-9\-]+)"', html)
-    if not urls:
-        urls = [BASE_URL + u for u in re.findall(r'href="(/payment/invoice/[a-f0-9\-]+)"', html)]
-    if urls:
-        log(f"🔍 兜底找到 {len(urls)} 个发票链接，取第一个: {urls[0]}")
-        return urls[0]
+    all_ids = extract_invoice_ids(html)
+    log(f"🔍 /invoices 页共发现 {len(all_ids)} 个发票 ID")
 
-    log("⚠️ 未在 /invoices 找到发票链接")
+    # 找出新出现的
+    new_ids = [i for i in all_ids if i not in existing_ids]
+    log(f"🔍 相比点击前新出现的发票 ID: {new_ids[:5]}")
+
+    if new_ids:
+        # 取第一个（列表通常按时间倒序，最新的在前）
+        new_url = f"{BASE_URL}/payment/invoice/{new_ids[0]}"
+        log(f"✅ 找到新生成的发票: {new_url}")
+        return new_url
+
+    # 兜底：如果没找到新的，看看页面里有没有明确的 "Unpaid" 状态行
+    log("⚠️ 没有新发票 ID，尝试从 'Unpaid' 状态行提取...")
+    try:
+        # 找含 "Unpaid" 的行，然后找其中第一个发票链接
+        rows = page.locator('tr, div').filter(has_text=re.compile(r'\bUnpaid\b', re.I))
+        n = rows.count()
+        log(f"🔍 含 Unpaid 的行数: {n}")
+        for i in range(min(n, 10)):
+            try:
+                row = rows.nth(i)
+                link = row.locator('a[href*="/payment/invoice/"]').first
+                if link.count() > 0:
+                    href = link.get_attribute("href")
+                    if href:
+                        if not href.startswith("http"):
+                            href = BASE_URL + href
+                        log(f"✅ 从 Unpaid 行找到: {href}")
+                        return href
+            except Exception:
+                continue
+    except Exception as e:
+        log(f"⚠️ Unpaid 行处理失败: {e}")
+
+    # 最后兜底：取第一个
+    if all_ids:
+        new_url = f"{BASE_URL}/payment/invoice/{all_ids[0]}"
+        log(f"⚠️ 兜底取第一个发票: {new_url}")
+        return new_url
+
+    log("❌ 未找到任何发票")
     return None
 
 
 def click_invoice_pay_button(page):
-    """在发票页点击绿色 Pay 按钮"""
-    log("🔎 在发票页查找 'Pay' 按钮...")
+    """
+    精确点击发票页的绿色 Pay 按钮。
+    发票页 Pay 按钮在: <form action=".../payment/invoice/{uuid}/pay"> 内，class 含 bg-green-700
+    """
+    log("🔎 在发票页查找绿色 'Pay' 按钮...")
 
-    # 精确匹配绿色 Pay 按钮
-    selectors = [
-        'form[action*="/payment/invoice/"][action*="/pay"] button[type="submit"]',
+    # 最精确：表单 action 含 /payment/invoice/{uuid}/pay 内的 submit 按钮
+    exact_selectors = [
+        'form[action*="/payment/invoice/"][action$="/pay"] button[type="submit"]',
+        'form[action*="/payment/invoice/"] button[type="submit"]',
         'button.bg-green-700:has-text("Pay")',
-        'button[type="submit"]:has-text("Pay")',
+        'button[class*="bg-green-700"]:has-text("Pay")',
     ]
 
-    for sel in selectors:
+    for sel in exact_selectors:
         try:
             btns = page.locator(sel)
             n = btns.count()
             if n == 0:
                 continue
-            log(f"🔍 选择器 {sel} 匹配到 {n} 个")
+            log(f"🔍 选择器 {sel} 匹配 {n} 个")
 
             for i in range(n):
                 btn = btns.nth(i)
@@ -363,9 +393,9 @@ def click_invoice_pay_button(page):
                     text = ""
                 log(f"   - [{i}] text={text!r}")
 
-                # 排除 "Pay Now"、"Paypal" 等
+                # 排除 "Pay Now" / "Paypal" 等
                 if text == "Pay" or re.match(r"^Pay\s*[€$£]?\d", text):
-                    log(f"✅ 找到目标: {text!r}")
+                    log(f"✅ 锁定目标按钮: {text!r}")
                     if mouse_click_element(page, btn, f"Pay({text})"):
                         log("✅ 已物理点击 Pay")
                         return True
@@ -396,12 +426,13 @@ def renew_service(page, service_url):
     close_cookie_consent(page)
     handle_cloudflare(page)
 
-    # 记录已有发票链接，用于后续过滤
+    # 记录点击前的所有发票 ID
     existing_invoices = set()
     try:
         html0 = page.content()
-        existing_invoices = set(re.findall(r'/payment/invoice/([a-f0-9\-]+)', html0))
+        existing_invoices = set(re.findall(r'/payment/invoice/([a-f0-9\-]{20,})', html0))
         log(f"🔍 已记录 {len(existing_invoices)} 个已有发票 ID")
+        log(f"   样例: {list(existing_invoices)[:3]}")
     except Exception:
         pass
 
@@ -452,8 +483,7 @@ def renew_service(page, service_url):
     log("🔒 处理 CF Turnstile...")
     solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
 
-    url_before = page.url
-    log(f"🔍 点击前 URL: {url_before}")
+    log(f"🔍 点击前 URL: {page.url}")
 
     try:
         page.screenshot(path="before_create_invoice.png", full_page=True)
@@ -462,7 +492,6 @@ def renew_service(page, service_url):
     except Exception:
         pass
 
-    # === 物理点击 Create Invoice ===
     log("🖱️ 物理点击 'Create Invoice'...")
     clicked = False
     if mouse_click_element(page, create_btn, "Create Invoice"):
@@ -479,7 +508,7 @@ def renew_service(page, service_url):
                 log(f"❌ 点击 Create Invoice 失败: {e}")
                 return False
 
-    # === 短轮询：如果 URL 变了就直接用；否则去 /invoices 找 ===
+    # 短轮询
     log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
     invoice_url = None
     for i in range(NAV_POLL_SECONDS):
@@ -505,17 +534,16 @@ def renew_service(page, service_url):
     except Exception:
         pass
 
-    # === 没自动跳转，去 /invoices 找最新未付发票 ===
+    # 没自动跳转 → 去 /invoices 找新发票
     if not invoice_url:
-        log("⚠️ 未自动跳转，去 /invoices 找最新未付发票...")
-        time.sleep(5)  # 等后端处理完
-        invoice_url = find_latest_unpaid_invoice(page)
+        log("⚠️ 未自动跳转，去 /invoices 找新发票...")
+        time.sleep(5)
+        invoice_url = find_new_unpaid_invoice(page, existing_invoices)
 
     if not invoice_url:
-        log("❌ 无法找到发票 URL")
+        log("❌ 无法定位新发票")
         return False
 
-    # === 导航到发票页 ===
     log(f"🔗 导航到发票页: {invoice_url}")
     try:
         if page.url != invoice_url:
@@ -536,7 +564,6 @@ def renew_service(page, service_url):
     except Exception:
         pass
 
-    # === 点绿色 Pay 按钮 ===
     if not click_invoice_pay_button(page):
         log("❌ 未能在发票页点击 Pay")
         return False
@@ -555,14 +582,13 @@ def renew_service(page, service_url):
     log(f"🔍 Pay 后 URL: {page.url}")
     try:
         body_text = page.locator("body").inner_text().lower()
-        for kw in ["success", "paid", "thank", "complete", "已支付"]:
+        for kw in ["success", "paid", "thank", "complete", "completed"]:
             if kw in body_text:
                 log(f"✅ 页面出现成功提示: {kw}")
                 break
     except Exception:
         pass
 
-    # === 回服务页确认 ===
     log("🔍 返回服务页确认状态...")
     time.sleep(3)
     try:
