@@ -124,32 +124,55 @@ def get_turnstile_token_len(page):
 
 
 def is_cf_challenge_page(page):
+    """检测当前页是否是 CF 挑战页（Just a moment...）"""
     try:
-        title = page.title().lower()
+        title = (page.title() or "").lower()
         if "just a moment" in title or "checking your browser" in title:
             return True
+        if "attention required" in title:
+            return True
+    except Exception:
+        pass
+    try:
         if page.locator('#challenge-running, #challenge-stage, #cf-challenge-running').count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        u = page.url.lower()
+        if "/cdn-cgi/challenge" in u or "/challenge-platform" in u:
             return True
     except Exception:
         pass
     return False
 
 
-def wait_out_cf_challenge(page, max_wait=40):
+def wait_out_cf_challenge(page, max_wait=90, label=""):
+    """
+    等 CF 挑战页消失（更严格版）。
+    - 先无条件等 3 秒，让 title/DOM 稳定
+    - 然后循环检测，最多 max_wait 秒
+    """
+    # 先无条件等 3 秒，让页面稳定
+    time.sleep(3)
+
     if not is_cf_challenge_page(page):
         return True
-    log(f"⚠️ 检测到 CF 挑战页，等待自动通过（最多 {max_wait} 秒）...")
+
+    log(f"⚠️ 检测到 CF 挑战页{'（' + label + '）' if label else ''}，等待自动通过（最多 {max_wait} 秒）...")
     start = time.time()
     while time.time() - start < max_wait:
-        time.sleep(2)
+        time.sleep(3)
         if not is_cf_challenge_page(page):
             log(f"✅ CF 挑战已通过（用时 {int(time.time()-start)} 秒）")
             return True
-    log("❌ CF 挑战未通过")
+
+    log("❌ CF 挑战未通过（超时）")
     return False
 
 
 def login(page, email, password, cookie_value):
+    # ========== 尝试 Cookie 登录 ==========
     if cookie_value:
         log("📇 尝试 Cookie 登录...")
         try:
@@ -164,16 +187,23 @@ def login(page, email, password, cookie_value):
                 'sameSite': 'Lax'
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            wait_out_cf_challenge(page, max_wait=40)
+
+            # 等 CF 挑战（如果有）
+            wait_out_cf_challenge(page, max_wait=90, label="Cookie 登录")
             time.sleep(2)
-            log(f"📝 当前Title: {page.title()}, URL: {page.url}")
-            if "auth/login" not in page.url and not is_cf_challenge_page(page):
+
+            title = page.title()
+            url = page.url
+            log(f"📝 当前Title: {title}, URL: {url}")
+
+            if "auth/login" not in url and "just a moment" not in title.lower():
                 log("✅ Cookie 登录成功！")
                 return True
-            log("❌ Cookie 失效或被 CF 拦")
+            log("❌ Cookie 失效")
         except Exception as e:
             log(f"⚠️ Cookie 登录异常: {e}")
 
+    # ========== 尝试账号密码登录 ==========
     if not email or not password:
         return False
 
@@ -183,20 +213,67 @@ def login(page, email, password, cookie_value):
             page.context.clear_cookies()
         except Exception:
             pass
+
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        wait_out_cf_challenge(page, max_wait=40)
+
+        # 等 CF 挑战
+        wait_out_cf_challenge(page, max_wait=90, label="密码登录")
         time.sleep(2)
+
+        title = page.title()
+        url = page.url
+        log(f"📝 登录页 Title: {title}, URL: {url}")
+
+        # 等 email input 出现（最多 30 秒）
+        try:
+            page.wait_for_selector('input[name="email"]', timeout=30000)
+            log("✅ 登录表单已出现")
+        except Exception as e:
+            log(f"❌ 找不到登录表单（30 秒超时）: {e}")
+            log(f"   最终 Title: {page.title()}")
+            log(f"   最终 URL: {page.url}")
+            if is_cf_challenge_page(page):
+                log("   ⚠️ 页面仍被 CF 拦")
+            return False
+
         page.fill('input[name="email"]', email)
         page.fill('input[name="password"]', password)
         time.sleep(0.5)
-        page.click('button[type="submit"]')
-        time.sleep(3)
-        wait_out_cf_challenge(page, max_wait=40)
-        page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
-        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        wait_out_cf_challenge(page, max_wait=40)
-        if "auth/login" in page.url or is_cf_challenge_page(page):
+
+        # 点登录按钮（尝试多个选择器）
+        clicked = False
+        for sel in ['button[type="submit"]', 'button:has-text("Login")', 'button:has-text("Sign in")']:
+            try:
+                page.click(sel, timeout=5000)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            log("❌ 找不到登录按钮")
             return False
+
+        time.sleep(3)
+
+        # 等跳转（带 CF 处理）
+        try:
+            page.wait_for_url(lambda u: "auth/login" not in u, timeout=30000)
+        except Exception:
+            pass
+
+        wait_out_cf_challenge(page, max_wait=60, label="登录后跳转")
+
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        wait_out_cf_challenge(page, max_wait=60, label="dashboard")
+
+        title = page.title()
+        url = page.url
+        log(f"📝 登录后 Title: {title}, URL: {url}")
+
+        if "auth/login" in url or is_cf_challenge_page(page):
+            log("❌ 密码登录失败")
+            return False
+
         log("✅ 账号密码登录成功！")
         return True
     except Exception as e:
@@ -208,7 +285,7 @@ def get_server_id(page):
     try:
         time.sleep(3)
         if is_cf_challenge_page(page):
-            wait_out_cf_challenge(page, max_wait=40)
+            wait_out_cf_challenge(page, max_wait=60, label="dashboard")
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
         matches = re.findall(r'/service/(\d+)/manage', html)
@@ -227,7 +304,7 @@ def get_due_date(page, service_url):
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
             if is_cf_challenge_page(page):
-                wait_out_cf_challenge(page, max_wait=40)
+                wait_out_cf_challenge(page, max_wait=60, label="service")
         close_cookie_consent(page)
         body_text = page.locator("body").inner_text()
         patterns = [
@@ -380,7 +457,7 @@ def find_invoice_urls_via_dom(page, url):
     time.sleep(3)
     if is_cf_challenge_page(page):
         log("⚠️ 被 CF 挑战页拦截，等待自动通过...")
-        if not wait_out_cf_challenge(page, max_wait=40):
+        if not wait_out_cf_challenge(page, max_wait=60, label="invoices"):
             log("❌ CF 挑战未过，页面仍被拦")
             return []
 
@@ -437,7 +514,7 @@ def try_pay_invoice(page, invoice_url):
 
     time.sleep(2)
     if is_cf_challenge_page(page):
-        wait_out_cf_challenge(page, max_wait=40)
+        wait_out_cf_challenge(page, max_wait=60, label="invoice")
 
     close_cookie_consent(page)
     time.sleep(2)
@@ -542,7 +619,7 @@ def click_renew_and_create(page, service_url, attempt=1):
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
             if is_cf_challenge_page(page):
-                if not wait_out_cf_challenge(page, max_wait=40):
+                if not wait_out_cf_challenge(page, max_wait=60, label="service"):
                     log("❌ CF 挑战未过，跳过本轮")
                     return False
         close_cookie_consent(page)
@@ -707,7 +784,7 @@ def renew_service(page, service_url):
         page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(2)
         if is_cf_challenge_page(page):
-            wait_out_cf_challenge(page, max_wait=40)
+            wait_out_cf_challenge(page, max_wait=60, label="service")
         close_cookie_consent(page)
     except Exception as e:
         log(f"⚠️ 返回服务页失败: {e}")
@@ -718,21 +795,13 @@ def renew_service(page, service_url):
 def process_account(identifier, email, password, cookie_value, browser):
     log(f"=== 开始处理账号: {mask_email(email) or identifier} ===")
 
-    # 每个账号的录屏目录
-    safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', identifier)
-    video_dir = os.path.join("videos", safe_id)
-    os.makedirs(video_dir, exist_ok=True)
-
     context = browser.new_context(
         viewport={'width': 1920, 'height': 1080},
         user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         proxy={"server": PROXY_SERVER} if IS_PROXY else None,
-        record_video_dir=video_dir,           # ← 录屏
-        record_video_size={'width': 1280, 'height': 720},
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
-    log(f"🎬 已开启录屏，视频目录: {video_dir}/")
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
@@ -779,16 +848,11 @@ def process_account(identifier, email, password, cookie_value, browser):
             log(f"⚠️ 通知失败: {e}")
         try:
             context.close()
-            # close 后视频才会真正写入磁盘
-            time.sleep(1)
-            log(f"🎬 录屏已保存到 {video_dir}/")
-        except Exception as e:
-            log(f"⚠️ context 关闭失败: {e}")
+        except Exception:
+            pass
 
 
 def main():
-    os.makedirs("videos", exist_ok=True)
-
     if ACCOUNTS_JSON:
         try:
             accounts = json.loads(ACCOUNTS_JSON)
