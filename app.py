@@ -24,9 +24,12 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billing/invoice")
 
 # 时间参数
-WAIT_AFTER_MODAL_OPEN   = 20   # 弹窗弹出后等待
-WAIT_AFTER_CREATE_CLICK = 30   # 点击 Create Invoice 后等待
-FALLBACK_POLL_SECONDS   = 60   # 兜底轮询时长
+WAIT_RENDER_BEFORE_TURNSTILE = 5    # 弹窗弹出后先等几秒让 CF iframe 出现
+WAIT_AFTER_CREATE_CLICK      = 30   # 点击 Create Invoice 后等待（让后端生成发票）
+FALLBACK_POLL_SECONDS        = 60   # 兜底轮询时长
+CF_TURNSTILE_TIMEOUT         = 30   # 单次尝试解决 Turnstile 的超时
+CF_RETRY_WAIT                = 15   # 首次失败后的等待
+FALLBACK_WAIT_SECONDS        = 20   # 检测不到 checkbox 时的等待时间
 
 
 def log(message):
@@ -116,6 +119,100 @@ def handle_cloudflare(page):
         except Exception:
             pass
     log("❌ 验证超时。")
+    return False
+
+
+def solve_turnstile_checkbox(page, timeout=30):
+    """
+    主动检测并点击 Cloudflare Turnstile 复选框。
+    返回：
+      True  -> 验证已通过或未检测到验证
+      False -> 检测到验证，但无法点击（non-interactive 模式）
+    """
+    iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
+    start = time.time()
+    checkbox_found = False
+
+    while time.time() - start < timeout:
+        # 没有 iframe 说明已经通过或不需要验证
+        if page.locator(iframe_selector).count() == 0:
+            if checkbox_found:
+                log("✅ Cloudflare Turnstile 验证通过！")
+            else:
+                log("✅ 未检测到 Cloudflare Turnstile，跳过")
+            return True
+
+        log("⚠️ 检测到 Cloudflare Turnstile，尝试点击复选框...")
+
+        # 策略 1：直接通过 iframe 定位 checkbox
+        try:
+            frame = page.frame_locator(iframe_selector).first
+            checkbox = frame.locator('input[type="checkbox"]')
+            if checkbox.is_visible(timeout=3000):
+                checkbox_found = True
+                log("🖱️ 找到 checkbox，点击...")
+                time.sleep(random.uniform(0.8, 1.5))
+                checkbox.click()
+                log("⏳ 已点击 checkbox，等待验证结果...")
+
+                for _ in range(15):
+                    if page.locator(iframe_selector).count() == 0:
+                        log("✅ Cloudflare Turnstile 验证通过！")
+                        return True
+                    time.sleep(1)
+
+                log("⚠️ 点击后 iframe 未消失，继续尝试其他策略...")
+        except Exception as e:
+            log(f"⚠️ 策略 1 失败: {e}")
+
+        # 策略 2：嵌套 iframe
+        try:
+            inner = page.frame_locator(iframe_selector).frame_locator('iframe')
+            checkbox = inner.locator('input[type="checkbox"]')
+            if checkbox.is_visible(timeout=3000):
+                checkbox_found = True
+                log("🖱️ 在嵌套 iframe 中找到 checkbox，点击...")
+                time.sleep(random.uniform(0.8, 1.5))
+                checkbox.click()
+
+                for _ in range(15):
+                    if page.locator(iframe_selector).count() == 0:
+                        log("✅ 嵌套 iframe 验证通过！")
+                        return True
+                    time.sleep(1)
+        except Exception as e:
+            log(f"⚠️ 策略 2 失败: {e}")
+
+        # 策略 3：JS 强制点击
+        try:
+            log("🖱️ 策略 3：尝试 JS 强制点击...")
+            clicked = page.evaluate("""
+                () => {
+                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (!iframe) return false;
+                    try {
+                        const doc = iframe.contentDocument || iframe.contentWindow.document;
+                        const cb = doc.querySelector('input[type="checkbox"]');
+                        if (cb) { cb.click(); return true; }
+                    } catch (e) {}
+                    return false;
+                }
+            """)
+            if clicked:
+                checkbox_found = True
+                time.sleep(3)
+                if page.locator(iframe_selector).count() == 0:
+                    log("✅ JS 点击后验证通过！")
+                    return True
+        except Exception as e:
+            log(f"⚠️ 策略 3 失败: {e}")
+
+        time.sleep(2)
+
+    if checkbox_found:
+        log("❌ Cloudflare Turnstile 验证超时（已找到 checkbox 但未通过）")
+    else:
+        log("⚠️ Cloudflare Turnstile 未找到 checkbox（可能是 non-interactive 模式）")
     return False
 
 
@@ -322,8 +419,38 @@ def renew_service(page, service_url):
     handle_cloudflare(page)
     close_cookie_consent(page)
 
-    log(f"⏳ 弹窗已弹出，等待 {WAIT_AFTER_MODAL_OPEN} 秒让页面渲染/校验完成...")
-    time.sleep(WAIT_AFTER_MODAL_OPEN)
+    # === 弹窗已弹出，先等页面渲染，再处理 CF Turnstile ===
+    log(f"⏳ 弹窗已弹出，等待 {WAIT_RENDER_BEFORE_TURNSTILE} 秒让页面渲染...")
+    time.sleep(WAIT_RENDER_BEFORE_TURNSTILE)
+
+    log("🔒 尝试处理 Cloudflare Turnstile 验证...")
+    turnstile_ok = solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
+
+    if not turnstile_ok:
+        # 区分：是没找到 checkbox（non-interactive），还是找到了但没通过
+        iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
+        if page.locator(iframe_selector).count() == 0:
+            log("✅ Turnstile iframe 已消失，视为通过")
+            turnstile_ok = True
+        else:
+            log(f"⚠️ Turnstile 未通过，等待 {CF_RETRY_WAIT} 秒后重试...")
+            time.sleep(CF_RETRY_WAIT)
+            turnstile_ok = solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
+
+    if not turnstile_ok:
+        iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
+        if page.locator(iframe_selector).count() == 0:
+            log("✅ Turnstile iframe 已消失，视为通过")
+            turnstile_ok = True
+        else:
+            # 检测不到 checkbox，回退到等待模式
+            log(f"⚠️ 无法主动通过 CF 验证，回退到等待 {FALLBACK_WAIT_SECONDS} 秒...")
+            time.sleep(FALLBACK_WAIT_SECONDS)
+            if page.locator(iframe_selector).count() == 0:
+                log("✅ 等待后 Turnstile iframe 已消失，视为通过")
+                turnstile_ok = True
+            else:
+                log("⚠️ Turnstile 仍未通过，继续尝试后续操作...")
 
     # 诊断
     try:
@@ -348,7 +475,6 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 处理 checkbox 出错: {e}")
 
-    # 等按钮从 disabled 变 enabled
     for _ in range(20):
         try:
             if not create_btn.is_disabled():
@@ -366,7 +492,6 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 保存点击前现场失败: {e}")
 
-    # 枚举可见按钮文本
     try:
         btns = page.locator('button:visible')
         n = btns.count()
@@ -382,7 +507,6 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 枚举按钮失败: {e}")
 
-    # 监听点击后可能出现的 POST/PUT 请求
     def on_response(resp):
         try:
             if resp.request.method in ("POST", "PUT", "PATCH") and "invoice" in resp.url.lower():
@@ -391,7 +515,6 @@ def renew_service(page, service_url):
             pass
     page.on("response", on_response)
 
-    # 记录点击前状态
     pages_before = len(page.context.pages)
     log(f"🔍 点击前 URL: {page.url}")
 
