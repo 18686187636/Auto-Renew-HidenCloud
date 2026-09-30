@@ -21,8 +21,8 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
-WAIT_RENDER_BEFORE_CF = 5
-CF_TURNSTILE_TIMEOUT  = 45
+WAIT_RENDER_BEFORE_CF = 8    # 给弹窗里的 Turnstile iframe 更多渲染时间
+CF_TURNSTILE_TIMEOUT  = 60   # 单次验证最多等 60 秒
 NAV_POLL_SECONDS      = 30
 WAIT_AFTER_PAY        = 15
 PAGE_LOAD_TIMEOUT     = 60000
@@ -104,7 +104,6 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 def save_debug(page, name):
-    """保存截图 + HTML，用于诊断"""
     try:
         page.screenshot(path=f"{name}.png", full_page=True)
     except Exception:
@@ -170,7 +169,53 @@ def _get_turnstile_token(page):
         return ""
 
 
-def solve_turnstile_checkbox(page, timeout=45):
+def _dump_turnstile_debug(page, tag):
+    """Turnstile 失败时，把每个 CF frame 的内容 dump 出来诊断"""
+    try:
+        token = _get_turnstile_token(page)
+        log(f"    [debug-{tag}] token_len={len(token)}")
+    except Exception:
+        pass
+    try:
+        for i, frame in enumerate(page.frames):
+            furl = frame.url or ""
+            if "cloudflare" in furl or "turnstile" in furl:
+                log(f"    [debug-{tag}] frame[{i}] url={furl[:100]}")
+                try:
+                    html = frame.content()
+                    log(f"    [debug-{tag}] frame[{i}] html_len={len(html)}")
+                    with open(f"cf_frame_{tag}_{i}.html", "w", encoding="utf-8") as f:
+                        f.write(html)
+                except Exception as e:
+                    log(f"    [debug-{tag}] frame[{i}] content 失败: {e}")
+    except Exception:
+        pass
+    try:
+        cnt = page.locator(TURNSTILE_IFRAME_SEL).count()
+        log(f"    [debug-{tag}] iframe 数量: {cnt}")
+        for i in range(cnt):
+            try:
+                box = page.locator(TURNSTILE_IFRAME_SEL).nth(i).bounding_box()
+                log(f"    [debug-{tag}] iframe[{i}] box={box}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        save_debug(page, f"cf_fail_{tag}")
+    except Exception:
+        pass
+
+
+# Turnstile 复选框在 iframe 内的合理点击坐标（相对于 iframe 左上角）
+TURNSTILE_COORDS = [(28, 28), (30, 32), (25, 30), (32, 30), (30, 25)]
+
+
+def solve_turnstile_checkbox(page, timeout=60):
+    """
+    三重策略 + 多点位点击处理 Cloudflare Turnstile。
+    每次点击后立即检查 cf-turnstile-response input 的 value。
+    """
     log(f"🔒 开始处理 Turnstile (超时 {timeout}s)")
     start = time.time()
     attempt = 0
@@ -186,82 +231,91 @@ def solve_turnstile_checkbox(page, timeout=45):
 
         iframe_count = page.locator(TURNSTILE_IFRAME_SEL).count()
         if iframe_count == 0:
-            time.sleep(1)
+            time.sleep(1.5)
             token = _get_turnstile_token(page)
             if token and len(token) > 10:
                 log("✅ Turnstile 已通过（iframe 消失）")
                 return True
-            time.sleep(1)
             continue
 
         log(f"🔍 attempt={attempt}: 检测到 {iframe_count} 个 CF iframe")
 
-        # 策略 A：直接操作 frame 对象
+        # ===== 策略 1：frame_locator 内部多点坐标点击 =====
+        try:
+            fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first
+            for coord in TURNSTILE_COORDS:
+                try:
+                    fl.locator('body').first.click(
+                        position={"x": coord[0], "y": coord[1]},
+                        timeout=2500, force=True, no_wait_after=True,
+                    )
+                    log(f"  ✅ 策略1: frame_locator 坐标点击 {coord}")
+                except Exception as e:
+                    log(f"  策略1 {coord} 失败: {e}")
+                time.sleep(1.5)
+                token = _get_turnstile_token(page)
+                if token and len(token) > 10:
+                    log(f"✅ Turnstile token 已填充 (len={len(token)})")
+                    return True
+        except Exception as e:
+            log(f"  策略1 异常: {e}")
+
+        # ===== 策略 2：直接操作 frame 对象内的 DOM 元素 =====
         try:
             for frame in page.frames:
                 furl = frame.url or ""
-                if "challenges.cloudflare.com" in furl:
-                    for sel in ['input[type="checkbox"]', '[role="checkbox"]']:
-                        try:
-                            cb = frame.locator(sel).first
-                            if cb.count() > 0:
-                                cb.click(timeout=2000, force=True)
-                                log(f"  ✅ A: frame 内部 {sel} 点击")
-                                time.sleep(2)
-                        except Exception:
-                            pass
+                if "challenges.cloudflare.com" not in furl:
+                    continue
+                # 2a. 明确的目标元素
+                for sel in ['input[type="checkbox"]', '[role="checkbox"]',
+                            'label', 'div.cb-lb', 'div']:
+                    try:
+                        el = frame.locator(sel).first
+                        if el.count() == 0:
+                            continue
+                        el.click(timeout=2000, force=True, no_wait_after=True)
+                        log(f"  ✅ 策略2: frame 内点击 {sel}")
+                        time.sleep(1.5)
+                        token = _get_turnstile_token(page)
+                        if token and len(token) > 10:
+                            log(f"✅ Turnstile token 已填充 (len={len(token)})")
+                            return True
+                    except Exception:
+                        continue
+                # 2b. body 坐标
+                for coord in TURNSTILE_COORDS:
                     try:
                         frame.locator('body').click(
-                            position={"x": 30, "y": 32},
-                            timeout=2000, force=True
+                            position={"x": coord[0], "y": coord[1]},
+                            timeout=2000, force=True, no_wait_after=True,
                         )
-                        log("  ✅ A3: frame body 坐标点击")
-                        time.sleep(2)
+                        log(f"  ✅ 策略2: frame body 坐标 {coord}")
+                        time.sleep(1.5)
+                        token = _get_turnstile_token(page)
+                        if token and len(token) > 10:
+                            log(f"✅ Turnstile token 已填充 (len={len(token)})")
+                            return True
                     except Exception:
-                        pass
+                        continue
         except Exception as e:
-            log(f"  策略A 异常: {e}")
+            log(f"  策略2 异常: {e}")
 
-        token = _get_turnstile_token(page)
-        if token and len(token) > 10:
-            log(f"✅ Turnstile token 已填充 (len={len(token)})")
-            return True
-
-        # 策略 B：frame_locator + position
-        try:
-            fl = page.frame_locator(TURNSTILE_IFRAME_SEL).first
-            try:
-                fl.locator('body').first.click(
-                    position={"x": 30, "y": 32}, timeout=3000, force=True
-                )
-                log("  ✅ B: frame_locator body 坐标点击")
-            except Exception as e:
-                log(f"  B 失败: {e}")
-        except Exception as e:
-            log(f"  策略B 异常: {e}")
-
-        time.sleep(2)
-        token = _get_turnstile_token(page)
-        if token and len(token) > 10:
-            log(f"✅ Turnstile token 已填充 (len={len(token)})")
-            return True
-
-        # 策略 C：外层鼠标坐标点击
+        # ===== 策略 3：外层鼠标 + down/up，多比例坐标 =====
         try:
             box = page.locator(TURNSTILE_IFRAME_SEL).first.bounding_box()
             if box:
-                for ratio in (0.05, 0.09):
-                    x = box["x"] + box["width"] * ratio
-                    y = box["y"] + box["height"] / 2
-                    log(f"  🖱️ C: 物理点击 ({x:.0f}, {y:.0f})")
-                    page.mouse.move(x - random.uniform(70, 110),
-                                    y - random.uniform(30, 55))
-                    time.sleep(random.uniform(0.25, 0.45))
+                for ratio_x, ratio_y in [(0.05, 0.5), (0.08, 0.5), (0.06, 0.6), (0.04, 0.4)]:
+                    x = box["x"] + box["width"] * ratio_x
+                    y = box["y"] + box["height"] * ratio_y
+                    log(f"  🖱️ 策略3: 外层鼠标 ({x:.0f},{y:.0f})")
+                    page.mouse.move(x - random.uniform(60, 100),
+                                    y - random.uniform(20, 40))
+                    time.sleep(random.uniform(0.3, 0.5))
                     page.mouse.move(x + random.uniform(-3, 3),
                                     y + random.uniform(-3, 3))
-                    time.sleep(random.uniform(0.1, 0.25))
+                    time.sleep(random.uniform(0.1, 0.2))
                     page.mouse.down()
-                    time.sleep(random.uniform(0.05, 0.14))
+                    time.sleep(random.uniform(0.05, 0.12))
                     page.mouse.up()
                     time.sleep(2)
                     token = _get_turnstile_token(page)
@@ -269,11 +323,12 @@ def solve_turnstile_checkbox(page, timeout=45):
                         log(f"✅ Turnstile token 已填充 (len={len(token)})")
                         return True
         except Exception as e:
-            log(f"  策略C 异常: {e}")
+            log(f"  策略3 异常: {e}")
 
-        time.sleep(2)
+        time.sleep(1.5)
 
     log("❌ CF Turnstile 验证超时")
+    _dump_turnstile_debug(page, f"fail_{int(time.time())}")
     return False
 
 
@@ -308,7 +363,6 @@ def close_cookie_consent(page):
 
 
 def goto_and_settle(page, url, timeout=PAGE_LOAD_TIMEOUT):
-    """goto 后等 networkidle，再触发 CF 处理"""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
     except Exception as e:
@@ -401,10 +455,6 @@ DATE_PATTERN = re.compile(
 
 
 def get_due_date(page, service_url, retries=2):
-    """
-    打开服务页，等待 'Due date' 出现。
-    若失败会 reload 重试，最后保存 debug 文件。
-    """
     for attempt in range(retries + 1):
         try:
             if attempt > 0:
@@ -420,7 +470,6 @@ def get_due_date(page, service_url, retries=2):
                     handle_cloudflare(page)
                     close_cookie_consent(page)
 
-            # 等待 "Due date" 或 "Renew" 出现（最多 20s）
             for _ in range(20):
                 try:
                     body_text = page.locator("body").inner_text()
@@ -430,16 +479,14 @@ def get_due_date(page, service_url, retries=2):
                     break
                 time.sleep(1)
 
-            # 尝试匹配日期
             m = DATE_PATTERN.search(body_text)
             if m:
                 due = m.group(1).strip()
                 log(f"📅 获取到Due Date: {due}")
                 return due
 
-            # 兜底：仅抓日期格式
             hits = re.findall(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}", body_text)
-            log(f"🔍 第 {attempt+1} 次：页面日期样式文本 {hits[:8]}，页面长度 {len(body_text)}")
+            log(f"🔍 第 {attempt+1} 次：日期样式文本 {hits[:8]}，页面长度 {len(body_text)}")
         except Exception as e:
             log(f"❌ 获取Due Date 第 {attempt+1} 次失败: {e}")
 
@@ -586,9 +633,6 @@ def try_pay_invoice(page, invoice_url):
 
 
 def find_renew_button(page, timeout=30):
-    """
-    尝试多个选择器定位 Renew 按钮/链接，返回 (locator, selector) 或 (None, None)
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         for sel in RENEW_BTN_SELECTORS:
@@ -614,7 +658,6 @@ def renew_service(page, service_url):
     log("➡ 进入续期流程...")
     close_cookie_consent(page)
 
-    # 确保在服务页
     if service_url not in page.url:
         log(f"🔄 重新导航到服务页: {service_url}")
         goto_and_settle(page, service_url)
@@ -622,7 +665,6 @@ def renew_service(page, service_url):
         handle_cloudflare(page)
         close_cookie_consent(page)
 
-    # 先等待 "Renew" 文本出现在 DOM（最多 30s）
     log("🖱️ 准备点击 'Renew'...")
     renew_btn, used_sel = find_renew_button(page, timeout=30)
 
@@ -658,7 +700,6 @@ def renew_service(page, service_url):
             try:
                 renew_btn.click(timeout=8000)
             except Exception:
-                # 若失效，重新查找
                 renew_btn, used_sel = find_renew_button(page, timeout=10)
                 if renew_btn is None:
                     log("❌ 重试时未找到 Renew 按钮")
@@ -667,7 +708,8 @@ def renew_service(page, service_url):
 
             time.sleep(2)
             body_lower = page.locator("body").inner_text().lower()
-            for kw in ["renewal restricted", "can only renew", "not yet time", "too early", "renewal window"]:
+            for kw in ["renewal restricted", "can only renew", "not yet time",
+                       "too early", "renewal window"]:
                 if kw in body_lower:
                     log("⚠️ 未到续期时间")
                     return "NOT_TIME"
@@ -760,7 +802,6 @@ def renew_service(page, service_url):
 
     save_debug(page, "after_create_invoice_redirect")
 
-    # === 支付处理 ===
     paid_ok = False
 
     if auto_url:
