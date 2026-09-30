@@ -23,13 +23,18 @@ RENEW_URL_KEYWORDS   = ("/renew",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF   = 20
-CF_CLICK_TIMEOUT        = 60    # 点 checkbox 最长尝试时间
+CF_CLICK_TIMEOUT        = 60
 NAV_POLL_SECONDS        = 30
 WAIT_AFTER_PAY          = 15
 WAIT_AFTER_RENEW_RESP   = 20
 RENEW_VERIFY_ATTEMPTS   = 3
 RENEW_VERIFY_INTERVAL   = 10
 ACCOUNT_INTERVAL_SEC    = 90
+
+# 页面渲染等待
+PAGE_NETWORKIDLE_TIMEOUT = 30000   # ms
+PAGE_EXTRA_WAIT          = 5       # 秒
+RENEW_BTN_WAIT           = 30000   # ms，30秒等 Renew 按钮
 
 CF_IFRAME_SEL = (
     'iframe[src*="challenges.cloudflare.com"], '
@@ -72,6 +77,16 @@ def mask_email(email):
 def safe_filename(email, fallback=""):
     base = email or fallback or "account"
     return re.sub(r'[^a-zA-Z0-9]', '_', base)[:60]
+
+
+def wait_page_ready(page, extra_wait=PAGE_EXTRA_WAIT, timeout_ms=PAGE_NETWORKIDLE_TIMEOUT):
+    """等待页面真正渲染完成：networkidle + 额外等待。"""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception as e:
+        log(f"ℹ️ wait networkidle 超时/异常: {e}")
+    if extra_wait > 0:
+        time.sleep(extra_wait)
 
 
 def get_current_ip(proxy_server=None):
@@ -195,10 +210,8 @@ def click_accept_if_present(page):
 # ---------- Cloudflare 核心 ----------
 
 def _turnstile_token_ready(page):
-    """严格检查 CF token 是否生成。只认 token，不认容器状态。"""
     try:
         result = page.evaluate("""() => {
-            // 1) 标准 input/textarea
             const sels = [
                 'input[name="cf-turnstile-response"]',
                 'input[id^="cf-chl-widget-"][id$="_response"]',
@@ -210,7 +223,6 @@ def _turnstile_token_ready(page):
                     return {ok: true, src: s, val: el.value.slice(0, 40)};
                 }
             }
-            // 2) .cf-turnstile 上的 data-response 属性
             const widget = document.querySelector('.cf-turnstile');
             if (widget) {
                 const r = widget.getAttribute('data-response');
@@ -218,7 +230,6 @@ def _turnstile_token_ready(page):
                     return {ok: true, src: 'data-response', val: r.slice(0, 40)};
                 }
             }
-            // 3) 全局回调标记
             if (window.__cf_turnstile_done) {
                 return {ok: true, src: 'global-flag', val: ''};
             }
@@ -232,7 +243,6 @@ def _turnstile_token_ready(page):
 
 
 def _get_cf_widget_info(page):
-    """打印 CF widget / iframe 的实际位置，方便调试。"""
     try:
         return page.evaluate("""() => {
             const out = {};
@@ -261,7 +271,6 @@ def _get_cf_widget_info(page):
 
 
 def _try_frame_locator_click(page):
-    """方案1：用 frame_locator 进入 CF iframe 点击。"""
     frame_sels = [
         'iframe[src*="challenges.cloudflare.com"]',
         '.cf-turnstile iframe',
@@ -271,7 +280,6 @@ def _try_frame_locator_click(page):
     for frame_sel in frame_sels:
         try:
             fl = page.frame_locator(frame_sel)
-            # 先试内部 checkbox
             for inner_sel in ['input[type="checkbox"]', '[role="checkbox"]', 'label']:
                 try:
                     loc = fl.locator(inner_sel).first
@@ -281,7 +289,6 @@ def _try_frame_locator_click(page):
                         return True
                 except Exception:
                     pass
-            # 再试直接点 body 的左侧 30,30
             try:
                 body = fl.locator('body').first
                 if body.count() > 0:
@@ -296,7 +303,6 @@ def _try_frame_locator_click(page):
 
 
 def _try_iframe_coord_click(page):
-    """方案2：定位 CF iframe，点它的左侧 30px。"""
     try:
         loc = page.locator(CF_IFRAME_SEL).first
         if loc.count() == 0:
@@ -304,11 +310,9 @@ def _try_iframe_coord_click(page):
         box = loc.bounding_box()
         if not box:
             return False
-        # CF checkbox 通常在 iframe 左侧约 30px、垂直居中
         x = box["x"] + min(30, box["width"] * 0.3)
         y = box["y"] + box["height"] / 2
         log(f"🖱️ 点 iframe 左侧 ({x:.0f}, {y:.0f})  box=({box['x']:.0f},{box['y']:.0f},{box['width']:.0f}x{box['height']:.0f})")
-        # 更自然的轨迹
         page.mouse.move(x - random.uniform(80, 120), y - random.uniform(40, 60))
         time.sleep(random.uniform(0.2, 0.4))
         page.mouse.move(x - random.uniform(20, 40), y - random.uniform(10, 20))
@@ -325,7 +329,6 @@ def _try_iframe_coord_click(page):
 
 
 def _try_cdp_click(page):
-    """方案3：CDP Input.dispatchMouseEvent，事件更接近真实。"""
     try:
         loc = page.locator(CF_IFRAME_SEL).first
         if loc.count() == 0:
@@ -336,7 +339,6 @@ def _try_cdp_click(page):
         x = box["x"] + min(30, box["width"] * 0.3)
         y = box["y"] + box["height"] / 2
         client = page.context.new_cdp_session(page)
-        # 移动
         client.send("Input.dispatchMouseEvent", {
             "type": "mouseMoved", "x": x - 60, "y": y - 30, "button": "none"
         })
@@ -345,13 +347,11 @@ def _try_cdp_click(page):
             "type": "mouseMoved", "x": x, "y": y, "button": "none"
         })
         time.sleep(0.1)
-        # 按下
         client.send("Input.dispatchMouseEvent", {
             "type": "mousePressed", "x": x, "y": y,
             "button": "left", "clickCount": 1, "buttons": 1
         })
         time.sleep(0.08)
-        # 抬起
         client.send("Input.dispatchMouseEvent", {
             "type": "mouseReleased", "x": x, "y": y,
             "button": "left", "clickCount": 1, "buttons": 0
@@ -364,24 +364,16 @@ def _try_cdp_click(page):
 
 
 def try_click_cf_checkbox(page):
-    """按优先级尝试三种点击方式。"""
-    # 方案1
     if _try_frame_locator_click(page):
         return True
-    # 方案2
     if _try_iframe_coord_click(page):
         return True
-    # 方案3
     if _try_cdp_click(page):
         return True
     return False
 
 
 def solve_cf_and_wait_token(page, timeout=CF_CLICK_TIMEOUT, tag=""):
-    """
-    循环尝试点击 CF checkbox，直到 token 生成或超时。
-    只认 token 生成，不认容器消失。
-    """
     log(f"🔒 开始解决 CF（最长 {timeout}s），要求必须拿到 token")
 
     info = _get_cf_widget_info(page)
@@ -400,7 +392,6 @@ def solve_cf_and_wait_token(page, timeout=CF_CLICK_TIMEOUT, tag=""):
     start = time.time()
     attempt = 0
     while time.time() - start < timeout:
-        # 先检查是否已有 token
         tok = _turnstile_token_ready(page)
         if tok:
             log(f"✅ Turnstile token 已生成: src={tok.get('src')} val={tok.get('val')}")
@@ -411,7 +402,6 @@ def solve_cf_and_wait_token(page, timeout=CF_CLICK_TIMEOUT, tag=""):
 
         try_click_cf_checkbox(page)
 
-        # 等几秒再检查
         for _ in range(6):
             time.sleep(1)
             tok = _turnstile_token_ready(page)
@@ -518,10 +508,14 @@ def login(page, email, password, cookie_value):
         return False
 
 
+# ---------- 服务页操作 ----------
+
 def get_server_id(page):
     try:
         handle_cloudflare(page)
         time.sleep(3)
+        # 等 dashboard 页渲染
+        wait_page_ready(page, extra_wait=3, timeout_ms=20000)
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
         matches = re.findall(r'/service/(\d+)/manage', html)
@@ -534,12 +528,15 @@ def get_server_id(page):
         return None
 
 
-def get_due_date(page, service_url):
+def get_due_date(page, service_url, tag=""):
     try:
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
+        # === 等待页面 JS 渲染完成 ===
+        wait_page_ready(page, extra_wait=PAGE_EXTRA_WAIT, timeout_ms=PAGE_NETWORKIDLE_TIMEOUT)
+        handle_cloudflare(page, tag=f"due_{tag}" if tag else "")
         close_cookie_consent(page)
+        time.sleep(2)
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -555,6 +552,12 @@ def get_due_date(page, service_url):
                 return due
         date_hits = re.findall(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}", body_text)
         log(f"🔍 页面中所有日期样式文本: {date_hits[:10]}")
+        log(f"🔍 body 长度: {len(body_text)}, 前 300 字: {body_text[:300]!r}")
+        if tag:
+            try:
+                page.screenshot(path=f"no_due_date_{tag}.png", full_page=True)
+            except Exception:
+                pass
     except Exception as e:
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
@@ -581,6 +584,7 @@ def get_unpaid_invoice_urls(page, tag="acc"):
         log(f"⚠️ 导航未付发票页失败: {e}")
         return []
 
+    wait_page_ready(page, extra_wait=3, timeout_ms=20000)
     handle_cloudflare(page)
     close_cookie_consent(page)
     time.sleep(3)
@@ -659,6 +663,7 @@ def try_pay_invoice(page, invoice_url, tag="acc"):
         log(f"⚠️ 导航失败: {e}")
         return False
 
+    wait_page_ready(page, extra_wait=2, timeout_ms=20000)
     handle_cloudflare(page)
     close_cookie_consent(page)
     time.sleep(2)
@@ -744,14 +749,46 @@ def renew_service(page, service_url, tag="acc"):
 
     if page.url != service_url:
         page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+    # === 等待服务页 JS 渲染完成 ===
+    wait_page_ready(page, extra_wait=PAGE_EXTRA_WAIT, timeout_ms=PAGE_NETWORKIDLE_TIMEOUT)
     close_cookie_consent(page)
-    handle_cloudflare(page, tag=tag)
+    handle_cloudflare(page, tag=f"renew_{tag}")
+    time.sleep(2)
 
     log("🖱️ 准备点击 'Renew'...")
     renew_btn = page.locator('button:has-text("Renew")').first
     create_btn = page.locator('button[type="submit"]:has-text("Create Invoice")').first
     if create_btn.count() == 0:
         create_btn = page.locator('button:has-text("Create Invoice")').first
+
+    # === 先确认页面确实渲染出了 Renew 按钮 ===
+    try:
+        page.wait_for_selector('button:has-text("Renew")', timeout=RENEW_BTN_WAIT)
+        log("✅ 检测到 Renew 按钮")
+    except Exception:
+        log(f"⚠️ {RENEW_BTN_WAIT/1000:.0f} 秒内未检测到 Renew 按钮，打印页面诊断...")
+        try:
+            log(f"当前 URL: {page.url}, Title: {page.title()}")
+            body_text = page.locator("body").inner_text()
+            log(f"body 长度: {len(body_text)}, 前 500 字: {body_text[:500]!r}")
+            page.screenshot(path=f"no_renew_btn_{tag}.png", full_page=True)
+            log("📸 已保存 no_renew_btn 截图")
+            # 列出所有按钮文本，便于诊断
+            try:
+                btns = page.locator('button')
+                nb = btns.count()
+                log(f"页面按钮数: {nb}")
+                for i in range(min(nb, 20)):
+                    try:
+                        t = (btns.nth(i).inner_text() or "").strip()
+                        if t:
+                            log(f"   button[{i}] = {t!r}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"⚠️ 页面诊断失败: {e}")
 
     modal_opened = False
     for i in range(3):
@@ -792,7 +829,7 @@ def renew_service(page, service_url, tag="acc"):
     if click_accept_if_present(page):
         time.sleep(2)
 
-    # === 关键：CF 必须解决，token 必须拿到，否则不点 Create Invoice ===
+    # === CF：必须拿到 token，否则不点 Create Invoice ===
     log("🔒 处理弹窗内 CF（必须拿到 token）...")
     if not solve_cf_and_wait_token(page, timeout=CF_CLICK_TIMEOUT, tag=f"modal_{tag}"):
         log("❌ 未拿到 CF token，放弃本次续期")
@@ -810,7 +847,6 @@ def renew_service(page, service_url, tag="acc"):
     except Exception:
         pass
 
-    # === 监听网络 ===
     net_log = []
     def _on_response(resp):
         try:
@@ -829,7 +865,6 @@ def renew_service(page, service_url, tag="acc"):
         log("❌ 点击 Create Invoice 失败")
         return False
 
-    # 等请求
     time.sleep(6)
 
     modal_still_open = False
@@ -842,14 +877,12 @@ def renew_service(page, service_url, tag="acc"):
     for status, method, url in net_log:
         log(f"📡 请求: {method} {status} {url}")
 
-    # 只认发票生成或弹窗关闭为成功
     if not modal_still_open:
         log("✅ 弹窗已关闭，请求已提交")
         log(f"⏳ 等待 {WAIT_AFTER_RENEW_RESP} 秒...")
         time.sleep(WAIT_AFTER_RENEW_RESP)
         return "REQUEST_SUBMITTED"
 
-    # 弹窗仍开 → 检查是否 captcha 错误
     body_lower = ""
     try:
         body_lower = page.locator("body").inner_text().lower()
@@ -864,7 +897,6 @@ def renew_service(page, service_url, tag="acc"):
             pass
         return False
 
-    # 弹窗开着但没 captcha 错误，可能是别的问题
     log("⚠️ 弹窗未关，但也没 captcha 错误，视为失败")
     return False
 
@@ -877,6 +909,7 @@ def verify_renewal(page, service_url, old_due, tag="acc"):
         try:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
             page.reload(wait_until="domcontentloaded", timeout=60000)
+            wait_page_ready(page, extra_wait=5, timeout_ms=PAGE_NETWORKIDLE_TIMEOUT)
             handle_cloudflare(page)
             close_cookie_consent(page)
         except Exception as e:
@@ -887,7 +920,7 @@ def verify_renewal(page, service_url, old_due, tag="acc"):
             window_msg = wm
             log(f"⚠️ 页面出现续费窗口提示: {wm}")
 
-        due = get_due_date(page, service_url)
+        due = get_due_date(page, service_url, tag=tag)
         if due != "未知":
             last_due = due
         log(f"📆 当前 Due Date: {last_due}")
@@ -930,7 +963,7 @@ def process_account(identifier, email, password, cookie_value, browser):
             return (status, old_due, new_due)
         service_url = f"{BASE_URL}/service/{server_id}/manage"
 
-        old_due = get_due_date(page, service_url)
+        old_due = get_due_date(page, service_url, tag=tag)
         log(f"📆 续费前到期时间：{old_due}")
 
         renew_result = renew_service(page, service_url, tag=tag)
