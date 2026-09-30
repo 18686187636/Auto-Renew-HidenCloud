@@ -21,11 +21,8 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
-# ==== 本次改动 ====
-WAIT_RENDER_BEFORE_CF   = 20   # 原 5，弹窗渲染等待
-CF_IFRAME_WAIT_SECONDS  = 30   # 原 15，CF iframe 等待
-# ==================
-
+WAIT_RENDER_BEFORE_CF   = 20
+CF_IFRAME_WAIT_SECONDS  = 30
 CF_TURNSTILE_TIMEOUT    = 30
 NAV_POLL_SECONDS        = 60
 WAIT_AFTER_PAY          = 15
@@ -582,13 +579,92 @@ def renew_service(page, service_url, tag="acc"):
 
     log(f"🔍 点击前 URL: {page.url}")
 
+    # === 点击 Create Invoice 前截图（全页 + 视口 + 弹窗）===
     try:
+        # 1) 全页截图
         page.screenshot(path=f"before_create_invoice_{tag}.png", full_page=True)
         with open(f"before_create_invoice_{tag}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
-    except Exception:
-        pass
+        log("📸 已保存全页截图 before_create_invoice")
 
+        # 2) 视口截图（弹窗更清晰）
+        page.screenshot(path=f"before_click_viewport_{tag}.png", full_page=False)
+        log("📸 已保存视口截图 before_click_viewport")
+
+        # 3) 弹窗区域截图
+        modal_saved = False
+        for msel in ['[role="dialog"]', '.modal', '.fixed.inset-0', 'div[class*="modal"]']:
+            try:
+                modal = page.locator(msel).first
+                if modal.count() > 0 and modal.is_visible():
+                    modal.screenshot(path=f"before_click_modal_{tag}.png")
+                    log(f"📸 已保存弹窗截图 ({msel})")
+                    modal_saved = True
+                    break
+            except Exception:
+                continue
+        if not modal_saved:
+            log("ℹ️ 未定位到弹窗元素，跳过弹窗截图")
+
+        # 4) 按钮状态
+        try:
+            log(f"🔍 create_btn visible={create_btn.is_visible()}, enabled={create_btn.is_enabled()}")
+        except Exception:
+            pass
+
+        # 5) 列出页面 iframe，确认 CF 是否真的存在
+        try:
+            iframes = page.locator('iframe')
+            n_if = iframes.count()
+            log(f"🔍 页面 iframe 数: {n_if}")
+            for i in range(min(n_if, 10)):
+                try:
+                    src = iframes.nth(i).get_attribute('src') or ''
+                    title = iframes.nth(i).get_attribute('title') or ''
+                    log(f"   iframe[{i}] src={src[:120]} title={title}")
+                except Exception:
+                    continue
+        except Exception as e:
+            log(f"⚠️ 枚举 iframe 失败: {e}")
+
+        # 6) 检查 shadow DOM 里的 turnstile 痕迹
+        try:
+            cf_hint = page.evaluate("""() => {
+                const hits = [];
+                const scan = (root, path) => {
+                    try {
+                        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                        let n = walker.currentNode;
+                        while (n) {
+                            const id = n.id || '';
+                            const cls = (n.className && n.className.toString) ? n.className.toString() : '';
+                            const tag = n.tagName ? n.tagName.toLowerCase() : '';
+                            if (id.includes('turnstile') || cls.includes('turnstile') ||
+                                id.includes('cf-') || cls.includes('cf-') ||
+                                tag === 'iframe') {
+                                hits.push((path + '>' + tag + '#' + id + '.' + cls).slice(0, 160));
+                            }
+                            if (n.shadowRoot) scan(n.shadowRoot, path + '>' + tag + '[shadow]');
+                            n = walker.nextNode();
+                        }
+                    } catch (e) {}
+                };
+                scan(document.body, 'body');
+                return hits.slice(0, 20);
+            }""")
+            if cf_hint:
+                log("🔍 DOM 中疑似 CF/turnstile 元素:")
+                for h in cf_hint:
+                    log(f"   {h}")
+            else:
+                log("ℹ️ DOM 中未发现 turnstile/cf-* 痕迹")
+        except Exception as e:
+            log(f"⚠️ 扫描 shadow DOM 失败: {e}")
+
+    except Exception as e:
+        log(f"⚠️ 点击前截图失败: {e}")
+
+    # === 监听网络响应 ===
     net_log = []
     def _on_response(resp):
         try:
