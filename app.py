@@ -20,10 +20,15 @@ IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
-# 发票 URL 关键词（放宽匹配）
+# 发票 URL 关键词
 INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billing/invoice")
 
-# 日志
+# 时间参数
+WAIT_AFTER_MODAL_OPEN   = 20   # 弹窗弹出后等待（让前端渲染 / checkbox 出现）
+WAIT_AFTER_CREATE_CLICK = 30   # 点击 Create Invoice 后等待（让后端生成发票）
+FALLBACK_POLL_SECONDS   = 60   # 30 秒未跳转时的兜底轮询时长
+
+
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
@@ -154,7 +159,6 @@ def close_cookie_consent(page):
             except Exception:
                 continue
 
-        # 找不到按钮就 JS 移除
         page.evaluate("""
             document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-header').forEach(el => el.remove());
         """)
@@ -198,7 +202,6 @@ def login(page, email, password, cookie_value):
 
     log("💣 尝试账号密码登录...")
     try:
-        # 清掉可能残留的失效 Cookie，避免干扰
         try:
             page.context.clear_cookies()
         except Exception:
@@ -330,9 +333,9 @@ def renew_service(page, service_url):
     handle_cloudflare(page)
     close_cookie_consent(page)
 
-    # === 关键新增：弹窗弹出后等待 20 秒让页面渲染 / 校验完成 ===
-    log("⏳ 弹窗已弹出，等待 20 秒让页面渲染/校验完成...")
-    time.sleep(20)
+    # === 弹窗弹出后等待，让页面渲染 / 校验完成 ===
+    log(f"⏳ 弹窗已弹出，等待 {WAIT_AFTER_MODAL_OPEN} 秒让页面渲染/校验完成...")
+    time.sleep(WAIT_AFTER_MODAL_OPEN)
 
     # 点击前诊断
     try:
@@ -358,7 +361,7 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 处理 checkbox 出错: {e}")
 
-    # 等按钮变成可用
+    # 等按钮从 disabled 变 enabled
     for _ in range(20):
         try:
             if not create_btn.is_disabled():
@@ -367,8 +370,9 @@ def renew_service(page, service_url):
             break
         time.sleep(0.5)
 
-    # 记录点击前的页面数（用于检测新标签页）
+    # 记录点击前状态
     pages_before = len(page.context.pages)
+    log(f"🔍 点击前 URL: {page.url}")
 
     log("🖱️ 点击 'Create Invoice'...")
     try:
@@ -392,8 +396,11 @@ def renew_service(page, service_url):
         page.screenshot(path="create_invoice_click_failed.png")
         return False
 
-    # 点击后等 3 秒，保存现场
-    time.sleep(3)
+    # === 点击后等待，让后端生成发票 ===
+    log(f"⏳ 已点击 Create Invoice，等待 {WAIT_AFTER_CREATE_CLICK} 秒让后端处理...")
+    time.sleep(WAIT_AFTER_CREATE_CLICK)
+
+    # 保存现场
     try:
         page.screenshot(path="after_create_invoice_click.png", full_page=True)
         with open("after_create_invoice_click.html", "w", encoding="utf-8") as f:
@@ -402,44 +409,65 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 保存现场失败: {e}")
 
-    # 检测是否打开了新标签页
+    # 检查是否打开新标签页
     pages_after = len(page.context.pages)
-    log(f"🔍 点击后页面数: {pages_before} -> {pages_after}")
-    if pages_after > pages_before:
-        new_page = page.context.pages[-1]
-        try:
-            new_page.wait_for_load_state("domcontentloaded", timeout=30000)
-        except Exception:
-            pass
-        log(f"✅ 检测到新标签页: {new_page.url}")
-        if any(k in new_page.url for k in ("/invoice", "/payment", "/billing")):
-            page = new_page
-
-    # 等待跳转到发票页面
+    log(f"🔍 等待后页面数: {pages_before} -> {pages_after}")
     new_invoice_url = None
-    start_wait = time.time()
-    while time.time() - start_wait < 90:
-        cur = page.url
-        if any(k in cur for k in INVOICE_URL_KEYWORDS):
-            new_invoice_url = cur
-            log(f"🎉 页面已跳转: {new_invoice_url}")
-            break
-        if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-            log("⚠️ 遇到拦截，尝试处理...")
-            handle_cloudflare(page)
-        time.sleep(1)
+
+    if pages_after > pages_before:
+        for p in page.context.pages:
+            if any(k in p.url for k in INVOICE_URL_KEYWORDS):
+                try:
+                    p.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                new_invoice_url = p.url
+                page = p
+                log(f"✅ 在新标签页发现发票: {new_invoice_url}")
+                break
+
+    # 当前页是否已跳转
+    if not new_invoice_url and any(k in page.url for k in INVOICE_URL_KEYWORDS):
+        new_invoice_url = page.url
+        log(f"🎉 当前页已跳转: {new_invoice_url}")
+
+    # 兜底轮询
+    if not new_invoice_url:
+        log(f"⏳ 未跳转，继续兜底轮询 {FALLBACK_POLL_SECONDS} 秒...")
+        start_wait = time.time()
+        while time.time() - start_wait < FALLBACK_POLL_SECONDS:
+            if any(k in page.url for k in INVOICE_URL_KEYWORDS):
+                new_invoice_url = page.url
+                log(f"🎉 页面已跳转: {new_invoice_url}")
+                break
+            for p in page.context.pages:
+                if any(k in p.url for k in INVOICE_URL_KEYWORDS):
+                    new_invoice_url = p.url
+                    page = p
+                    log(f"🎉 在其它标签页发现发票: {new_invoice_url}")
+                    break
+            if new_invoice_url:
+                break
+            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                log("⚠️ 遇到拦截，尝试处理...")
+                handle_cloudflare(page)
+            time.sleep(1)
 
     if not new_invoice_url:
         log("❌ 未能进入发票页面，超时。")
         try:
             page.screenshot(path="renew_stuck_invoice.png", full_page=True)
+            with open("renew_stuck_invoice.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
         except Exception:
             pass
         return False
 
+    # === 进入发票页，点击 Pay ===
     if page.url != new_invoice_url:
-        page.goto(new_invoice_url)
+        page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
     handle_cloudflare(page)
+    close_cookie_consent(page)
 
     log("🔎 查找 'Pay' 按钮...")
     try:
@@ -472,25 +500,21 @@ def process_account(identifier, email, password, cookie_value, browser):
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
-        # 登录
         if not login(page, email, password, cookie_value):
             status = "❌ 登录失败"
             return (status, old_due, new_due)
 
         close_cookie_consent(page)
 
-        # 获取 Server ID
         server_id = get_server_id(page)
         if not server_id:
             status = "❌ 获取Server ID失败"
             return (status, old_due, new_due)
         service_url = f"{BASE_URL}/service/{server_id}/manage"
 
-        # 旧到期时间
         old_due = get_due_date(page, service_url)
         log(f"📆 续费前到期时间：{old_due}")
 
-        # 执行续期
         renew_result = renew_service(page, service_url)
 
         if renew_result == "NOT_TIME":
@@ -514,7 +538,6 @@ def process_account(identifier, email, password, cookie_value, browser):
         return (status, old_due, new_due)
 
     finally:
-        # 无论成功失败都发通知
         try:
             send_telegram_notification(status, old_due, new_due, email or identifier)
         except Exception as e:
@@ -544,7 +567,6 @@ def main():
         accounts = [{"email": EMAIL, "password": PASSWORD, "cookie": COOKIE_VALUE}]
         log("📋 单账号模式")
 
-    # 出口 IP
     current_ip = get_current_ip(PROXY_SERVER if IS_PROXY else None)
     log(f"🎯 当前出口IP: {current_ip}")
 
@@ -569,7 +591,6 @@ def main():
                 cookie = acc.get('cookie', '')
                 identifier = email or f"账号{idx+1}"
 
-                # 只要有 cookie 或 email+password 就处理
                 if not cookie and not (email and password):
                     log(f"⚠️ 第 {idx+1} 个账号缺少有效凭证，跳过")
                     continue
@@ -579,7 +600,6 @@ def main():
                 if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
                     all_success = False
 
-                # 不是最后一个就等 3 分钟
                 if idx < total - 1:
                     log("⏳ 等待 3 分钟后处理下一个账号...")
                     time.sleep(180)
