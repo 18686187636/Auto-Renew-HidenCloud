@@ -3,7 +3,7 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 05 * * 3'
+    - cron: '30 05 * * 3'   # 每周三 05:30 UTC，可根据需要修改
 
 permissions:
   actions: write
@@ -51,7 +51,7 @@ jobs:
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
-      - name: 📤 上传诊断截图和 HTML
+      - name: 📤 上传诊断截图、HTML 和录屏
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -59,6 +59,7 @@ jobs:
           path: |
             *.png
             *.html
+            videos/**
           if-no-files-found: ignore
           retention-days: 7
 
