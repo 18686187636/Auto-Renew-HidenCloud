@@ -32,6 +32,7 @@ CF_IFRAME_SEL = (
 WAIT_RENDER_BEFORE_CF = 5
 WAIT_AFTER_PAY        = 15
 NAV_POLL_SECONDS      = 20
+CLICK_MAX_ATTEMPTS    = 5
 
 
 def log(message):
@@ -130,7 +131,6 @@ def get_turnstile_token_len(page):
 
 
 def diagnose_turnstile(page):
-    """打印所有 Turnstile 容器的状态（是否有 iframe、位置、尺寸）"""
     try:
         diag = page.evaluate("""
             () => {
@@ -142,13 +142,9 @@ def diagnose_turnstile(page):
                     out.push({
                         idx: idx,
                         hasIframe: !!ifr,
-                        src: ifr ? (ifr.src || '').substring(0, 100) : null,
-                        x: Math.round(r.x),
-                        y: Math.round(r.y),
-                        w: Math.round(r.width),
-                        h: Math.round(r.height),
-                        visible: r.width > 0 && r.height > 0,
-                        display: window.getComputedStyle(c).display
+                        x: Math.round(r.x), y: Math.round(r.y),
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        visible: r.width > 0 && r.height > 0
                     });
                 });
                 return out;
@@ -161,108 +157,65 @@ def diagnose_turnstile(page):
         return []
 
 
-def solve_turnstile_checkbox(page):
+def try_solve_cf(page, max_wait=20):
     """
-    等 Turnstile input 出现 → 等 token 生成 → 未生成则点击容器位置
+    尝试处理 CF：有 iframe 就点 iframe，有容器就点容器。
+    【不阻断流程】—— 无论结果如何都返回，让 Create Invoice 继续。
     """
-    log("🔍 等待 Turnstile input 出现（最多 15 秒）...")
-
+    log(f"🔒 尝试处理 CF（最多 {max_wait} 秒，不阻断流程）...")
     start = time.time()
-    has_turnstile = False
-    while time.time() - start < 15:
-        if get_turnstile_token_len(page) >= 0:
-            log("✅ 检测到 Turnstile input")
-            has_turnstile = True
-            break
-        time.sleep(1)
-
-    if not has_turnstile:
-        log("⚠️ 未检测到 Turnstile input，视为无 CF")
-        return True
-
-    token_len = get_turnstile_token_len(page)
-    if token_len > 0:
-        log(f"✅ token 已生成（{token_len}）")
-        return True
-
-    log("🔒 token 为空，开始点击 Turnstile 容器...")
-    click_start = time.time()
     attempt = 0
 
-    while time.time() - click_start < 60:
-        token_len = get_turnstile_token_len(page)
-        if token_len > 0:
-            log(f"✅ token 已生成（{token_len}）")
-            return True
-
+    while time.time() - start < max_wait:
         attempt += 1
-        clicked = False
 
-        # === 核心：直接点击 cf-turnstile 容器位置 ===
-        try:
-            container = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').first
-            cnt = container.count()
-            if cnt > 0:
-                box = container.bounding_box()
-                if box and box["width"] > 0 and box["height"] > 0:
-                    # Turnstile checkbox 在容器左侧
-                    x = box["x"] + 25
-                    y = box["y"] + box["height"] / 2
-                    log(f"🖱️ 尝试 {attempt}: 点击容器位置 ({x:.0f}, {y:.0f}) size=({box['width']:.0f}x{box['height']:.0f})")
-                    page.mouse.move(x - random.uniform(30, 60), y - random.uniform(15, 30))
-                    time.sleep(0.2)
-                    page.mouse.move(x, y)
-                    time.sleep(0.15)
-                    page.mouse.click(x, y)
-                    clicked = True
-                else:
-                    log(f"🖱️ 尝试 {attempt}: 容器无尺寸 (box={box})")
-        except Exception as e:
-            log(f"⚠️ 点击容器失败: {e}")
+        # token 出现 → 提前退出
+        if get_turnstile_token_len(page) > 0:
+            log(f"✅ token 已生成（长度 {get_turnstile_token_len(page)}）")
+            return
 
-        # 备用：如果 iframe 出现了，点 iframe
-        if not clicked:
-            try:
-                iframe_n = page.locator(CF_IFRAME_SEL).count()
-                if iframe_n > 0:
-                    frames = page.locator(CF_IFRAME_SEL)
-                    box = frames.first.bounding_box()
-                    if box:
-                        x = box["x"] + 25
-                        y = box["y"] + box["height"] / 2
-                        log(f"🖱️ 尝试 {attempt}: 点击 iframe ({x:.0f}, {y:.0f})")
-                        page.mouse.click(x, y)
-                        clicked = True
-            except Exception:
-                pass
-
-        # 每 3 次打印一次诊断
-        if attempt % 3 == 0:
-            diagnose_turnstile(page)
-
-        time.sleep(3)
-
-    token_len = get_turnstile_token_len(page)
-    if token_len > 0:
-        log(f"✅ token 已生成（{token_len}）")
-        return True
-    log("❌ Turnstile 处理超时，token 仍为空")
-    diagnose_turnstile(page)
-    return False
-
-
-def handle_cloudflare(page):
-    token_len = get_turnstile_token_len(page)
-    if token_len < 0:
-        # 完全没有 Turnstile input，视为无 CF
+        # 尝试点 iframe
         try:
             iframe_n = page.locator(CF_IFRAME_SEL).count()
-            container_n = page.locator('div.cf-turnstile, [data-sitekey]').count()
-            if iframe_n == 0 and container_n == 0:
-                return True
+            if iframe_n > 0:
+                box = page.locator(CF_IFRAME_SEL).first.bounding_box()
+                if box and box["width"] > 0:
+                    x = box["x"] + 30
+                    y = box["y"] + box["height"] / 2
+                    log(f"🖱️ 尝试 {attempt}: 点 iframe ({x:.0f}, {y:.0f})")
+                    page.mouse.click(x, y)
+                    time.sleep(3)
+                    continue
         except Exception:
-            return True
-    return solve_turnstile_checkbox(page)
+            pass
+
+        # 尝试点容器左侧
+        try:
+            container = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').first
+            if container.count() > 0:
+                box = container.bounding_box()
+                if box and box["width"] > 0:
+                    # 容器可能很宽（576），Try 多个 X 坐标
+                    xs = [
+                        box["x"] + 20,
+                        box["x"] + 30,
+                        box["x"] + 50,
+                        box["x"] + box["width"] / 2,
+                    ]
+                    y = box["y"] + box["height"] / 2
+                    x = random.choice(xs)
+                    log(f"🖱️ 尝试 {attempt}: 点容器 ({x:.0f}, {y:.0f}) size=({box['width']:.0f}x{box['height']:.0f})")
+                    page.mouse.move(x - 20, y - 10)
+                    time.sleep(0.15)
+                    page.mouse.click(x, y)
+                    time.sleep(3)
+                    continue
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+    log("⚠️ CF 处理时间到，继续流程（让前端自己处理 token）")
 
 
 def close_cookie_consent(page):
@@ -300,7 +253,6 @@ def login(page, email, password, cookie_value):
                 'sameSite': 'Lax'
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            handle_cloudflare(page)
             log(f"📝 当前Title: {page.title()}")
             if "auth/login" not in page.url:
                 log("✅ Cookie 登录成功！")
@@ -319,17 +271,14 @@ def login(page, email, password, cookie_value):
         except Exception:
             pass
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
+        try_solve_cf(page, max_wait=10)
         page.fill('input[name="email"]', email)
         page.fill('input[name="password"]', password)
         time.sleep(0.5)
-        handle_cloudflare(page)
         page.click('button[type="submit"]')
         time.sleep(3)
-        handle_cloudflare(page)
         page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
         if "auth/login" in page.url:
             return False
         log("✅ 账号密码登录成功！")
@@ -341,7 +290,6 @@ def login(page, email, password, cookie_value):
 
 def get_server_id(page):
     try:
-        handle_cloudflare(page)
         time.sleep(3)
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
@@ -359,7 +307,6 @@ def get_due_date(page, service_url):
     try:
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
         close_cookie_consent(page)
         body_text = page.locator("body").inner_text()
         patterns = [
@@ -381,7 +328,11 @@ def get_due_date(page, service_url):
     return "未知"
 
 
-def click_create_invoice_once(page, create_btn):
+def click_create_invoice_with_retry(page, create_btn):
+    """
+    多次点击 Create Invoice，直到捕获到 POST /renew。
+    每次点击后等 8 秒。
+    """
     state = {"posted": False, "status": 0, "location": ""}
 
     def on_response(resp):
@@ -399,27 +350,43 @@ def click_create_invoice_once(page, create_btn):
 
     page.on("response", on_response)
 
-    log("🖱️ 点击 Create Invoice（单次）...")
-    clicked = mouse_click_element(page, create_btn, "Create Invoice")
-    if not clicked:
+    for attempt in range(1, CLICK_MAX_ATTEMPTS + 1):
+        log(f"🖱️ 第 {attempt}/{CLICK_MAX_ATTEMPTS} 次点击 Create Invoice...")
+        state["posted"] = False
+
+        # 检查按钮是否 disabled
         try:
-            create_btn.click(timeout=5000)
+            if create_btn.is_disabled():
+                log("⚠️ Create Invoice disabled，等 3 秒...")
+                time.sleep(3)
         except Exception:
+            pass
+
+        clicked = mouse_click_element(page, create_btn, f"CreateInvoice(尝试{attempt})")
+        if not clicked:
             try:
-                create_btn.evaluate("el => el.click()")
-            except Exception as e:
-                log(f"❌ 点击失败: {e}")
-                return False, 0, ""
+                create_btn.click(timeout=5000)
+            except Exception:
+                try:
+                    create_btn.evaluate("el => el.click()")
+                except Exception as e:
+                    log(f"⚠️ 所有点击方式失败: {e}")
 
-    for _ in range(30):
-        if state["posted"]:
-            break
-        time.sleep(0.5)
+        # 等 8 秒捕获 POST
+        for i in range(16):
+            time.sleep(0.5)
+            if state["posted"]:
+                log(f"✅ 第 {attempt} 次点击后捕获到 POST /renew（{state['status']}）")
+                return True, state["status"], state["location"]
 
-    return state["posted"], state["status"], state["location"]
+        log(f"⚠️ 第 {attempt} 次点击后未捕获 POST /renew，准备重试...")
+        time.sleep(2)
+
+    log(f"❌ {CLICK_MAX_ATTEMPTS} 次点击均未触发 POST /renew")
+    return False, 0, ""
 
 
-def wait_for_invoice_generated(page, timeout=30):
+def wait_for_invoice_generated(page, timeout=20):
     log(f"⏳ 等待 'Invoice has been generated' 提示（最多 {timeout} 秒）...")
     start = time.time()
     while time.time() - start < timeout:
@@ -446,7 +413,6 @@ def find_invoice_urls_via_dom(page, url):
             log(f"⚠️ 导航失败: {e}")
             return []
 
-    handle_cloudflare(page)
     close_cookie_consent(page)
     time.sleep(3)
 
@@ -498,7 +464,6 @@ def try_pay_invoice(page, invoice_url):
         log(f"⚠️ 导航失败: {e}")
         return False
 
-    handle_cloudflare(page)
     close_cookie_consent(page)
     time.sleep(2)
 
@@ -579,7 +544,6 @@ def click_renew_and_create(page, service_url, attempt=1):
     try:
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
         close_cookie_consent(page)
         time.sleep(2)
     except Exception as e:
@@ -627,14 +591,10 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # 先做一次诊断
+    # === 尝试处理 CF（不阻断）===
     log("🔍 弹窗内 Turnstile 状态诊断:")
     diagnose_turnstile(page)
-
-    cf_ok = solve_turnstile_checkbox(page)
-    if not cf_ok:
-        log("❌ CF 未通过，本轮跳过 Create Invoice")
-        return False
+    try_solve_cf(page, max_wait=20)
 
     try:
         page.screenshot(path=f"before_create_invoice_{attempt}.png", full_page=True)
@@ -644,13 +604,14 @@ def click_renew_and_create(page, service_url, attempt=1):
     except Exception:
         pass
 
-    posted, status, location = click_create_invoice_once(page, create_btn)
+    # === 核心：无论 CF 状态如何，都点击 Create Invoice ===
+    posted, status, location = click_create_invoice_with_retry(page, create_btn)
     if not posted:
-        log("⚠️ 未捕获 POST /renew（可能未触发）")
+        log("⚠️ 未能触发 POST /renew")
         return False
 
     log(f"✅ Create Invoice POST 已触发（{status}），Location: {location}")
-    wait_for_invoice_generated(page, timeout=30)
+    wait_for_invoice_generated(page, timeout=20)
     return True
 
 
@@ -731,7 +692,6 @@ def renew_service(page, service_url):
     time.sleep(3)
     try:
         page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
         close_cookie_consent(page)
     except Exception as e:
         log(f"⚠️ 返回服务页失败: {e}")
@@ -748,19 +708,6 @@ def process_account(identifier, email, password, cookie_value, browser):
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
-
-    # 监听 CF 相关请求，用于诊断
-    def on_request(req):
-        u = req.url or ""
-        if "challenges.cloudflare.com" in u or "turnstile" in u:
-            log(f"📡 [请求] {req.method} {u[:120]}")
-    page.on("request", on_request)
-
-    def on_requestfailed(req):
-        u = req.url or ""
-        if "challenges.cloudflare.com" in u or "turnstile" in u:
-            log(f"❌ [请求失败] {req.method} {u[:120]}  原因: {req.failure}")
-    page.on("requestfailed", on_requestfailed)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
