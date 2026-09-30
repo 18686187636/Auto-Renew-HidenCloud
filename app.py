@@ -5,12 +5,12 @@ import os, re, sys, time, random, requests, json
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # 单账号使用
+COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""
 EMAIL        = os.environ.get('EMAIL') or ""
 PASSWORD     = os.environ.get('PASSWORD') or ""
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
-ACCOUNTS_JSON = os.environ.get('ACCOUNTS_JSON') or ""  # 多账号 JSON
+ACCOUNTS_JSON = os.environ.get('ACCOUNTS_JSON') or ""
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -24,9 +24,9 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billing/invoice")
 
 # 时间参数
-WAIT_AFTER_MODAL_OPEN   = 20   # 弹窗弹出后等待（让前端渲染 / checkbox 出现）
-WAIT_AFTER_CREATE_CLICK = 30   # 点击 Create Invoice 后等待（让后端生成发票）
-FALLBACK_POLL_SECONDS   = 60   # 30 秒未跳转时的兜底轮询时长
+WAIT_AFTER_MODAL_OPEN   = 20   # 弹窗弹出后等待
+WAIT_AFTER_CREATE_CLICK = 30   # 点击 Create Invoice 后等待
+FALLBACK_POLL_SECONDS   = 60   # 兜底轮询时长
 
 
 def log(message):
@@ -34,7 +34,6 @@ def log(message):
 
 
 def mask_email(email):
-    """脱敏邮箱"""
     if not email:
         return "未知账号"
     if '@' in email:
@@ -52,7 +51,6 @@ window.chrome = { runtime: {} };
 
 
 def get_current_ip(proxy_server=None):
-    """获取当前出口IP"""
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
@@ -65,7 +63,6 @@ def get_current_ip(proxy_server=None):
 
 
 def send_telegram_notification(status, old_due, new_due, email):
-    """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
@@ -82,11 +79,7 @@ def send_telegram_notification(status, old_due, new_due, email):
         f"🕒 续期时间：{now}"
     )
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
@@ -127,7 +120,6 @@ def handle_cloudflare(page):
 
 
 def close_cookie_consent(page):
-    """检测并关闭页面上的 Cookie 同意弹窗"""
     try:
         consent_root = page.locator('.fc-consent-root')
         if consent_root.count() == 0:
@@ -169,8 +161,6 @@ def close_cookie_consent(page):
 
 
 def login(page, email, password, cookie_value):
-    """使用给定凭证登录，返回是否成功"""
-    # 1. Cookie 登录尝试
     if cookie_value:
         log("📇 尝试 Cookie 登录...")
         try:
@@ -195,7 +185,6 @@ def login(page, email, password, cookie_value):
         except Exception as e:
             log(f"⚠️ Cookie 登录异常: {e}")
 
-    # 2. 账号密码登录
     if not email or not password:
         log("⚠️ 无可用账号密码，跳过密码登录")
         return False
@@ -333,11 +322,10 @@ def renew_service(page, service_url):
     handle_cloudflare(page)
     close_cookie_consent(page)
 
-    # === 弹窗弹出后等待，让页面渲染 / 校验完成 ===
     log(f"⏳ 弹窗已弹出，等待 {WAIT_AFTER_MODAL_OPEN} 秒让页面渲染/校验完成...")
     time.sleep(WAIT_AFTER_MODAL_OPEN)
 
-    # 点击前诊断
+    # 诊断
     try:
         disabled = create_btn.is_disabled()
         log(f"🔍 Create Invoice disabled = {disabled}")
@@ -347,7 +335,6 @@ def renew_service(page, service_url):
     checkbox_count = page.locator('input[type="checkbox"]').count()
     log(f"🔍 弹窗内 checkbox 数量: {checkbox_count}")
 
-    # 勾选所有未勾选的 checkbox
     try:
         unchecked = page.locator('input[type="checkbox"]:not(:checked)')
         n = unchecked.count()
@@ -369,6 +356,40 @@ def renew_service(page, service_url):
         except Exception:
             break
         time.sleep(0.5)
+
+    # === 点击前截图 + 保存 HTML ===
+    try:
+        page.screenshot(path="before_create_invoice.png", full_page=True)
+        with open("before_create_invoice.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log("📸 已保存点击前截图和 HTML")
+    except Exception as e:
+        log(f"⚠️ 保存点击前现场失败: {e}")
+
+    # 枚举可见按钮文本
+    try:
+        btns = page.locator('button:visible')
+        n = btns.count()
+        btn_texts = []
+        for i in range(min(n, 30)):
+            try:
+                t = btns.nth(i).inner_text().strip()
+                if t:
+                    btn_texts.append(t)
+            except Exception:
+                pass
+        log(f"🔍 当前可见按钮: {btn_texts}")
+    except Exception as e:
+        log(f"⚠️ 枚举按钮失败: {e}")
+
+    # 监听点击后可能出现的 POST/PUT 请求
+    def on_response(resp):
+        try:
+            if resp.request.method in ("POST", "PUT", "PATCH") and "invoice" in resp.url.lower():
+                log(f"🌐 [{resp.status}] {resp.request.method} {resp.url}")
+        except Exception:
+            pass
+    page.on("response", on_response)
 
     # 记录点击前状态
     pages_before = len(page.context.pages)
@@ -396,11 +417,9 @@ def renew_service(page, service_url):
         page.screenshot(path="create_invoice_click_failed.png")
         return False
 
-    # === 点击后等待，让后端生成发票 ===
     log(f"⏳ 已点击 Create Invoice，等待 {WAIT_AFTER_CREATE_CLICK} 秒让后端处理...")
     time.sleep(WAIT_AFTER_CREATE_CLICK)
 
-    # 保存现场
     try:
         page.screenshot(path="after_create_invoice_click.png", full_page=True)
         with open("after_create_invoice_click.html", "w", encoding="utf-8") as f:
@@ -409,7 +428,6 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 保存现场失败: {e}")
 
-    # 检查是否打开新标签页
     pages_after = len(page.context.pages)
     log(f"🔍 等待后页面数: {pages_before} -> {pages_after}")
     new_invoice_url = None
@@ -426,12 +444,10 @@ def renew_service(page, service_url):
                 log(f"✅ 在新标签页发现发票: {new_invoice_url}")
                 break
 
-    # 当前页是否已跳转
     if not new_invoice_url and any(k in page.url for k in INVOICE_URL_KEYWORDS):
         new_invoice_url = page.url
         log(f"🎉 当前页已跳转: {new_invoice_url}")
 
-    # 兜底轮询
     if not new_invoice_url:
         log(f"⏳ 未跳转，继续兜底轮询 {FALLBACK_POLL_SECONDS} 秒...")
         start_wait = time.time()
@@ -463,7 +479,6 @@ def renew_service(page, service_url):
             pass
         return False
 
-    # === 进入发票页，点击 Pay ===
     if page.url != new_invoice_url:
         page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
     handle_cloudflare(page)
@@ -488,7 +503,6 @@ def renew_service(page, service_url):
 
 
 def process_account(identifier, email, password, cookie_value, browser):
-    """处理单个账号的续期，返回 (status, old_due, new_due)"""
     log(f"=== 开始处理账号: {mask_email(email) or identifier} ===")
     context = browser.new_context(
         viewport={'width': 1920, 'height': 1080},
@@ -549,7 +563,6 @@ def process_account(identifier, email, password, cookie_value, browser):
 
 
 def main():
-    # 检查凭证
     if ACCOUNTS_JSON:
         try:
             accounts = json.loads(ACCOUNTS_JSON)
