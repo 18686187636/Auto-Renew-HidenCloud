@@ -19,10 +19,11 @@ PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
 INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billing/invoice")
+PAY_PROCESS_KEYWORD  = "/payment/process/"
 
 WAIT_RENDER_BEFORE_TURNSTILE = 5
 WAIT_AFTER_CREATE_CLICK      = 30
-PAY_WAIT_SECONDS             = 90   # 等待支付请求
+PAY_WAIT_SECONDS             = 60
 CF_TURNSTILE_TIMEOUT         = 15
 CF_RETRY_WAIT                = 10
 
@@ -116,7 +117,6 @@ def handle_cloudflare(page):
 
 
 def solve_turnstile_checkbox(page, timeout=15):
-    """智能处理 CF Turnstile：找到 checkbox 就点，找不到快速跳过"""
     start = time.time()
     no_checkbox_rounds = 0
     MAX_NO_CHECKBOX_ROUNDS = 3
@@ -195,7 +195,6 @@ def solve_turnstile_checkbox(page, timeout=15):
                 if not still_cf:
                     log("✅ Turnstile 验证通过！")
                     return True
-                log("⚠️ 点击后 CF frame 仍在")
                 no_checkbox_rounds = 0
             else:
                 no_checkbox_rounds += 1
@@ -388,7 +387,6 @@ def get_due_date(page, service_url):
 
 
 def js_click(locator, page, label=""):
-    """JS 强制点击，绕过 viewport 限制"""
     try:
         locator.evaluate("el => { el.scrollIntoView({block:'center'}); el.click(); }")
         return True
@@ -404,7 +402,6 @@ def js_click(locator, page, label=""):
 
 
 def click_submit_button(page, locator, label=""):
-    """点击 type=submit 按钮：优先 form.requestSubmit"""
     try:
         ok = locator.evaluate("""
             el => {
@@ -439,6 +436,90 @@ def click_submit_button(page, locator, label=""):
         return False
 
 
+def complete_payment_page(page, pay_process_url):
+    """访问支付处理页并尝试完成支付"""
+    log(f"🔗 访问支付处理页: {pay_process_url}")
+    try:
+        page.goto(pay_process_url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        log(f"⚠️ 导航支付页失败: {e}")
+        return False
+
+    handle_cloudflare(page)
+    close_cookie_consent(page)
+    time.sleep(5)
+
+    log(f"📝 支付页 Title: {page.title()}")
+    log(f"📝 支付页 URL: {page.url}")
+    try:
+        page.screenshot(path="payment_process_page.png", full_page=True)
+        with open("payment_process_page.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log("📸 已保存支付页截图和 HTML")
+    except Exception as e:
+        log(f"⚠️ 保存支付页现场失败: {e}")
+
+    # 查看有哪些按钮
+    try:
+        btns = page.locator('button:visible, a.button:visible, input[type="submit"]:visible')
+        n = btns.count()
+        btn_texts = []
+        for i in range(min(n, 40)):
+            try:
+                t = btns.nth(i).inner_text().strip()
+                if t:
+                    btn_texts.append(t)
+            except Exception:
+                pass
+        log(f"🔍 支付页可见按钮: {btn_texts}")
+    except Exception:
+        pass
+
+    # 尝试点击支付/确认类按钮
+    confirm_patterns = [
+        'button:has-text("Pay")',
+        'button:has-text("Confirm")',
+        'button:has-text("Complete")',
+        'button:has-text("Submit")',
+        'button:has-text("Continue")',
+        'button:has-text("Proceed")',
+        'a:has-text("Pay")',
+        'a:has-text("Confirm")',
+        'button[type="submit"]',
+    ]
+
+    clicked = False
+    for sel in confirm_patterns:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible(timeout=1000):
+                log(f"🖱️ 尝试点击支付页按钮: {sel}")
+                if js_click(btn, page, f"支付页 {sel}"):
+                    clicked = True
+                    time.sleep(8)
+                    log(f"🔍 点击后 URL: {page.url}")
+                    # 如果 URL 变了，或出现成功提示，就认为完成
+                    if PAY_PROCESS_KEYWORD not in page.url:
+                        log("✅ 已离开支付页，视为支付完成")
+                        return True
+                    # 可能有二次确认
+                    break
+        except Exception:
+            continue
+
+    if not clicked:
+        log("⚠️ 支付页未找到可点击按钮")
+
+    # 再等几秒看是否跳转
+    time.sleep(5)
+    if PAY_PROCESS_KEYWORD not in page.url:
+        log(f"✅ 已离开支付页: {page.url}")
+        return True
+
+    log(f"⚠️ 仍停留在支付页: {page.url}")
+    return True  # 即便没完成也返回 True，让上层对比到期时间
+
+
 def renew_service(page, service_url):
     log("➡ 进入续期流程...")
     close_cookie_consent(page)
@@ -464,16 +545,10 @@ def renew_service(page, service_url):
             renew_btn.click()
 
             time.sleep(2)
-            page_text = page.locator("body").inner_text()
-            page_text_lower = page_text.lower()
+            page_text_lower = page.locator("body").inner_text().lower()
             restricted_keywords = [
-                "renewal restricted",
-                "can only renew",
-                "not yet time",
-                "too early",
-                "within 7 days",
-                "within 3 days",
-                "renewal window",
+                "renewal restricted", "can only renew", "not yet time",
+                "too early", "within 7 days", "within 3 days", "renewal window",
             ]
             if any(k in page_text_lower for k in restricted_keywords):
                 log("⚠️ 未到续期时间，无法续期。")
@@ -550,22 +625,7 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 保存点击前现场失败: {e}")
 
-    try:
-        btns = page.locator('button:visible')
-        n = btns.count()
-        btn_texts = []
-        for i in range(min(n, 30)):
-            try:
-                t = btns.nth(i).inner_text().strip()
-                if t:
-                    btn_texts.append(t)
-            except Exception:
-                pass
-        log(f"🔍 当前可见按钮: {btn_texts}")
-    except Exception as e:
-        log(f"⚠️ 枚举按钮失败: {e}")
-
-    # === 监听关键请求（含 Location 头） ===
+    # === 监听关键请求（含 Location） ===
     state = {"paid": False, "renewed": False, "pay_location": "", "renew_location": ""}
 
     def on_response(resp):
@@ -619,8 +679,46 @@ def renew_service(page, service_url):
     if state['renew_location']:
         log(f"🔍 /renew 重定向到: {state['renew_location']}")
 
-    # === 检查是否进入发票页 ===
     new_invoice_url = None
+
+    # === 核心：点击 Pay Now，等待 /balance/add，捕获支付页 URL ===
+    if not state["paid"]:
+        log("🔍 检查弹窗内是否出现 'Pay Now'...")
+        try:
+            pay_now = page.locator('button:has-text("Pay Now"), a:has-text("Pay Now")').first
+            cnt = pay_now.count()
+            log(f"🔍 Pay Now 按钮数量: {cnt}")
+            if cnt > 0:
+                log("✅ 发现 'Pay Now'，用 JS 强制点击")
+                js_click(pay_now, page, "Pay Now")
+
+                log(f"⏳ 等待 /balance/add 重定向（最多 {PAY_WAIT_SECONDS} 秒）...")
+                for i in range(PAY_WAIT_SECONDS):
+                    if state["pay_location"]:
+                        log(f"✅ 捕获支付页 URL: {state['pay_location']}")
+                        break
+                    if i > 0 and i % 15 == 0:
+                        log(f"   ... 已等待 {i} 秒")
+                    time.sleep(1)
+
+                if not state["pay_location"]:
+                    log(f"⚠️ {PAY_WAIT_SECONDS} 秒内未捕获 /balance/add Location")
+                    # 兜底：主动导航到服务页可能触发
+                    log("🔍 兜底：重新加载服务页以触发 /balance/add...")
+                    try:
+                        page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        time.sleep(8)
+                    except Exception as e:
+                        log(f"⚠️ 兜底加载失败: {e}")
+
+                # 拿到 Location 后主动导航到支付页
+                if state["pay_location"]:
+                    complete_payment_page(page, state["pay_location"])
+        except Exception as e:
+            log(f"⚠️ 处理 Pay Now 失败: {e}")
+
+    # === 兜底：如果发现发票 URL 关键词 ===
     pages_after = len(page.context.pages)
     if pages_after > pages_before:
         for p in page.context.pages:
@@ -634,46 +732,6 @@ def renew_service(page, service_url):
         new_invoice_url = page.url
         log(f"🎉 当前页跳转: {new_invoice_url}")
 
-    # === 核心：点击 Pay Now + 监听 /balance/add ===
-    if not new_invoice_url and not state["paid"]:
-        log("🔍 检查弹窗内是否出现 'Pay Now'...")
-        try:
-            pay_now = page.locator('button:has-text("Pay Now"), a:has-text("Pay Now")').first
-            cnt = pay_now.count()
-            log(f"🔍 Pay Now 按钮数量: {cnt}")
-            if cnt > 0:
-                log("✅ 发现 'Pay Now'，用 JS 强制点击")
-                js_click(pay_now, page, "Pay Now")
-
-                log(f"⏳ 等待支付请求 /balance/add（最多 {PAY_WAIT_SECONDS} 秒）...")
-                for i in range(PAY_WAIT_SECONDS):
-                    if state["paid"]:
-                        log(f"✅ 第 {i} 秒检测到 /balance/add，支付完成！")
-                        if state['pay_location']:
-                            log(f"🔍 /balance/add 重定向到: {state['pay_location']}")
-                        break
-                    if any(k in page.url for k in INVOICE_URL_KEYWORDS):
-                        new_invoice_url = page.url
-                        log(f"🎉 页面跳转: {new_invoice_url}")
-                        break
-                    for p in page.context.pages:
-                        if any(k in p.url for k in INVOICE_URL_KEYWORDS):
-                            new_invoice_url = p.url
-                            page = p
-                            log(f"🎉 新标签页跳转: {new_invoice_url}")
-                            break
-                    if new_invoice_url:
-                        break
-                    if i > 0 and i % 15 == 0:
-                        log(f"   ... 已等待 {i} 秒")
-                    time.sleep(1)
-
-                if not state["paid"] and not new_invoice_url:
-                    log(f"⚠️ {PAY_WAIT_SECONDS} 秒内未检测到支付响应")
-        except Exception as e:
-            log(f"⚠️ 处理 Pay Now 失败: {e}")
-
-    # === 如果进入了发票页，点 Pay ===
     if new_invoice_url:
         if page.url != new_invoice_url:
             page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
@@ -690,19 +748,9 @@ def renew_service(page, service_url):
         except Exception as e:
             log(f"⚠️ 点击 'Pay' 失败: {e}")
 
-    # === 兜底：如果既没支付也没跳转，再等 30 秒 ===
-    if not state["paid"] and not new_invoice_url and state["renewed"]:
-        log("⏳ 续期已触发但未见支付，再等 30 秒...")
-        for i in range(30):
-            if state["paid"]:
-                log(f"✅ 第 {i} 秒检测到 /balance/add")
-                break
-            time.sleep(1)
-
-    # === 最后：等页面稳定后重新加载服务页 ===
-    if state["paid"] or state["renewed"] or new_invoice_url:
-        log("⏳ 支付/续期已触发，等待 5 秒让后端处理...")
-        time.sleep(5)
+    # === 最后：回服务页确认到期时间 ===
+    log("⏳ 等待 5 秒让后端处理...")
+    time.sleep(5)
 
     log("🔍 返回服务页确认状态...")
     try:
@@ -712,11 +760,7 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 返回服务页失败: {e}")
 
-    if state["paid"] or state["renewed"] or new_invoice_url:
-        return True
-
-    log("❌ 未能完成续期流程")
-    return False
+    return True
 
 
 def process_account(identifier, email, password, cookie_value, browser):
@@ -760,8 +804,10 @@ def process_account(identifier, email, password, cookie_value, browser):
             log(f"📆 续费后到期时间：{new_due}")
             if new_due != "未知" and new_due == old_due:
                 status = "⚠️ 续期后到期时间未变化"
-                log("⚠️ 到期时间未变化，说明续期未真正生效")
-                log("⚠️ 请检查：余额是否充足？是否在续期窗口内？服务器状态是否正常？")
+                log("⚠️ 到期时间未变化，可能原因：")
+                log("   1. 未到续期窗口（HidenCloud 可能要求到期前 N 天内才可续期）")
+                log("   2. 余额不足")
+                log("   3. 支付流程未在支付页完成（请看 payment_process_page.png）")
             else:
                 status = "✅ 续期成功"
                 log("✅ 到期时间已更新，续期成功")
