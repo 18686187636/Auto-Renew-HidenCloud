@@ -21,11 +21,17 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
+CF_IFRAME_SEL = (
+    'iframe[src*="challenges.cloudflare.com"], '
+    'iframe[title*="cloudflare"], '
+    'iframe[src*="turnstile"], '
+    'iframe[src*="challenge-platform"], '
+    'iframe[src*="cf-chl"]'
+)
+
 WAIT_RENDER_BEFORE_CF = 5
-CF_DETECT_WAIT        = 15
-CF_TURNSTILE_TIMEOUT  = 30
-NAV_POLL_SECONDS      = 20
 WAIT_AFTER_PAY        = 15
+NAV_POLL_SECONDS      = 20
 
 
 def log(message):
@@ -108,22 +114,7 @@ def mouse_click_element(page, locator, label=""):
         return False
 
 
-CF_IFRAME_SEL = (
-    'iframe[src*="challenges.cloudflare.com"], '
-    'iframe[title*="cloudflare"], '
-    'iframe[src*="turnstile"], '
-    'iframe[src*="challenge-platform"], '
-    'iframe[src*="cf-chl"]'
-)
-
-
 def get_turnstile_token_len(page):
-    """
-    返回 Turnstile token 长度：
-      -1  → 页面没有 Turnstile input
-       0  → 有 Turnstile input，但 token 为空（未通过）
-      >0  → token 已生成（通过）
-    """
     try:
         return page.evaluate("""
             () => {
@@ -138,106 +129,139 @@ def get_turnstile_token_len(page):
         return -1
 
 
-def detect_cf_elements(page):
-    """返回 (iframe_count, container_count, token_len)"""
+def diagnose_turnstile(page):
+    """打印所有 Turnstile 容器的状态（是否有 iframe、位置、尺寸）"""
     try:
-        iframe_n = page.locator(CF_IFRAME_SEL).count()
-    except Exception:
-        iframe_n = 0
-    try:
-        container_n = page.locator('div.cf-turnstile, [data-sitekey]').count()
-    except Exception:
-        container_n = 0
-    token_len = get_turnstile_token_len(page)
-    return iframe_n, container_n, token_len
+        diag = page.evaluate("""
+            () => {
+                const cs = document.querySelectorAll('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]');
+                const out = [];
+                cs.forEach((c, idx) => {
+                    const ifr = c.querySelector('iframe');
+                    const r = c.getBoundingClientRect();
+                    out.push({
+                        idx: idx,
+                        hasIframe: !!ifr,
+                        src: ifr ? (ifr.src || '').substring(0, 100) : null,
+                        x: Math.round(r.x),
+                        y: Math.round(r.y),
+                        w: Math.round(r.width),
+                        h: Math.round(r.height),
+                        visible: r.width > 0 && r.height > 0,
+                        display: window.getComputedStyle(c).display
+                    });
+                });
+                return out;
+            }
+        """)
+        log(f"🔍 诊断: {diag}")
+        return diag
+    except Exception as e:
+        log(f"⚠️ 诊断失败: {e}")
+        return []
 
 
 def solve_turnstile_checkbox(page):
     """
-    等 Turnstile input 出现 → 等 token 生成 → 未生成则点击 iframe
-    返回 True 表示 CF 通过（或页面无 CF），False 表示 CF 未通过
+    等 Turnstile input 出现 → 等 token 生成 → 未生成则点击容器位置
     """
-    log(f"🔍 等待 Turnstile input 出现（最多 {CF_DETECT_WAIT} 秒）...")
+    log("🔍 等待 Turnstile input 出现（最多 15 秒）...")
 
     start = time.time()
-    token_len = -1
     has_turnstile = False
-
-    while time.time() - start < CF_DETECT_WAIT:
-        token_len = get_turnstile_token_len(page)
-        if token_len >= 0:
-            log(f"✅ 检测到 Turnstile input，token 长度={token_len}")
+    while time.time() - start < 15:
+        if get_turnstile_token_len(page) >= 0:
+            log("✅ 检测到 Turnstile input")
             has_turnstile = True
             break
         time.sleep(1)
 
     if not has_turnstile:
-        # 页面上没有 Turnstile input
-        iframe_n, container_n, _ = detect_cf_elements(page)
-        log(f"⚠️ {CF_DETECT_WAIT} 秒内未检测到 Turnstile input（iframe={iframe_n}, container={container_n}）")
-        log("   → 视为页面无 CF，跳过")
+        log("⚠️ 未检测到 Turnstile input，视为无 CF")
         return True
 
+    token_len = get_turnstile_token_len(page)
     if token_len > 0:
-        log(f"✅ Turnstile token 已生成（长度 {token_len}）")
+        log(f"✅ token 已生成（{token_len}）")
         return True
 
-    # 有 input 但 token 为空 → 需要点击
-    log("🔒 Turnstile token 为空，等待/点击 iframe...")
+    log("🔒 token 为空，开始点击 Turnstile 容器...")
     click_start = time.time()
     attempt = 0
 
-    while time.time() - click_start < CF_TURNSTILE_TIMEOUT:
+    while time.time() - click_start < 60:
         token_len = get_turnstile_token_len(page)
         if token_len > 0:
-            log(f"✅ Turnstile token 已生成（长度 {token_len}）")
+            log(f"✅ token 已生成（{token_len}）")
             return True
 
         attempt += 1
-        iframe_n, container_n, _ = detect_cf_elements(page)
-        log(f"🔍 尝试 {attempt}: iframe={iframe_n}, container={container_n}, token={token_len}")
+        clicked = False
 
-        # 有 iframe → 物理点击
-        if iframe_n > 0:
-            frames = page.locator(CF_IFRAME_SEL)
-            for i in range(frames.count()):
-                try:
-                    box = frames.nth(i).bounding_box()
-                    if not box:
-                        continue
-                    x = box["x"] + 30
+        # === 核心：直接点击 cf-turnstile 容器位置 ===
+        try:
+            container = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').first
+            cnt = container.count()
+            if cnt > 0:
+                box = container.bounding_box()
+                if box and box["width"] > 0 and box["height"] > 0:
+                    # Turnstile checkbox 在容器左侧
+                    x = box["x"] + 25
                     y = box["y"] + box["height"] / 2
-                    log(f"🖱️ 物理点击 CF iframe[{i}] ({x:.0f}, {y:.0f})")
-                    page.mouse.move(x - random.uniform(60, 90), y - random.uniform(20, 40))
-                    time.sleep(0.3)
-                    page.mouse.move(x, y)
+                    log(f"🖱️ 尝试 {attempt}: 点击容器位置 ({x:.0f}, {y:.0f}) size=({box['width']:.0f}x{box['height']:.0f})")
+                    page.mouse.move(x - random.uniform(30, 60), y - random.uniform(15, 30))
                     time.sleep(0.2)
+                    page.mouse.move(x, y)
+                    time.sleep(0.15)
                     page.mouse.click(x, y)
-                    time.sleep(4)
-                except Exception as e:
-                    log(f"⚠️ 点击 CF iframe[{i}] 失败: {e}")
-        else:
-            # 没 iframe 但有 input，可能是 invisible Turnstile
-            time.sleep(2)
+                    clicked = True
+                else:
+                    log(f"🖱️ 尝试 {attempt}: 容器无尺寸 (box={box})")
+        except Exception as e:
+            log(f"⚠️ 点击容器失败: {e}")
+
+        # 备用：如果 iframe 出现了，点 iframe
+        if not clicked:
+            try:
+                iframe_n = page.locator(CF_IFRAME_SEL).count()
+                if iframe_n > 0:
+                    frames = page.locator(CF_IFRAME_SEL)
+                    box = frames.first.bounding_box()
+                    if box:
+                        x = box["x"] + 25
+                        y = box["y"] + box["height"] / 2
+                        log(f"🖱️ 尝试 {attempt}: 点击 iframe ({x:.0f}, {y:.0f})")
+                        page.mouse.click(x, y)
+                        clicked = True
+            except Exception:
+                pass
+
+        # 每 3 次打印一次诊断
+        if attempt % 3 == 0:
+            diagnose_turnstile(page)
+
+        time.sleep(3)
 
     token_len = get_turnstile_token_len(page)
-    log(f"⚠️ Turnstile 处理超时，最终 token 长度={token_len}")
     if token_len > 0:
+        log(f"✅ token 已生成（{token_len}）")
         return True
-    log("❌ Turnstile 未通过（token 为空）")
+    log("❌ Turnstile 处理超时，token 仍为空")
+    diagnose_turnstile(page)
     return False
 
 
 def handle_cloudflare(page):
-    """通用 CF 处理：先检查有无 Turnstile input，再决定是否需要处理"""
     token_len = get_turnstile_token_len(page)
-    iframe_n, container_n, _ = detect_cf_elements(page)
-
-    # 页面完全没有 Turnstile / CF 元素
-    if token_len < 0 and iframe_n == 0 and container_n == 0:
-        return True
-
-    # 有 CF，走完整流程
+    if token_len < 0:
+        # 完全没有 Turnstile input，视为无 CF
+        try:
+            iframe_n = page.locator(CF_IFRAME_SEL).count()
+            container_n = page.locator('div.cf-turnstile, [data-sitekey]').count()
+            if iframe_n == 0 and container_n == 0:
+                return True
+        except Exception:
+            return True
     return solve_turnstile_checkbox(page)
 
 
@@ -358,7 +382,6 @@ def get_due_date(page, service_url):
 
 
 def click_create_invoice_once(page, create_btn):
-    """点击 Create Invoice 只点 1 次，捕获 POST /renew 和 Location"""
     state = {"posted": False, "status": 0, "location": ""}
 
     def on_response(resp):
@@ -388,7 +411,6 @@ def click_create_invoice_once(page, create_btn):
                 log(f"❌ 点击失败: {e}")
                 return False, 0, ""
 
-    # 等 15 秒捕获响应（原 10 秒可能不够）
     for _ in range(30):
         if state["posted"]:
             break
@@ -397,7 +419,7 @@ def click_create_invoice_once(page, create_btn):
     return state["posted"], state["status"], state["location"]
 
 
-def wait_for_invoice_generated(page, timeout=40):
+def wait_for_invoice_generated(page, timeout=30):
     log(f"⏳ 等待 'Invoice has been generated' 提示（最多 {timeout} 秒）...")
     start = time.time()
     while time.time() - start < timeout:
@@ -430,21 +452,12 @@ def find_invoice_urls_via_dom(page, url):
 
     log(f"📝 页面 Title: {page.title()}, URL: {page.url}")
 
-    # 拿到整个 HTML
     html = page.content()
-
-    # 提取所有发票链接（相对 + 绝对）
     all_links = set()
-
-    # 相对路径
     for m in re.finditer(r'href="(/payment/invoice/[a-fA-F0-9\-]{20,})"', html):
         all_links.add(BASE_URL + m.group(1))
-
-    # 绝对路径
     for m in re.finditer(r'href="(https?://[^"]*?/payment/invoice/[a-fA-F0-9\-]{20,})"', html):
         all_links.add(m.group(1))
-
-    # 也尝试从 JS/onclick 里找
     for m in re.finditer(r'/payment/invoice/([a-fA-F0-9\-]{20,})', html):
         all_links.add(f"{BASE_URL}/payment/invoice/{m.group(1)}")
 
@@ -614,7 +627,10 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # CF 处理
+    # 先做一次诊断
+    log("🔍 弹窗内 Turnstile 状态诊断:")
+    diagnose_turnstile(page)
+
     cf_ok = solve_turnstile_checkbox(page)
     if not cf_ok:
         log("❌ CF 未通过，本轮跳过 Create Invoice")
@@ -628,17 +644,13 @@ def click_renew_and_create(page, service_url, attempt=1):
     except Exception:
         pass
 
-    # 点击 Create Invoice（单次）
     posted, status, location = click_create_invoice_once(page, create_btn)
     if not posted:
         log("⚠️ 未捕获 POST /renew（可能未触发）")
         return False
 
     log(f"✅ Create Invoice POST 已触发（{status}），Location: {location}")
-
-    # 等成功提示（可选的进一步确认）
     wait_for_invoice_generated(page, timeout=30)
-
     return True
 
 
@@ -652,11 +664,10 @@ def renew_service(page, service_url):
         if result == "NOT_TIME":
             return "NOT_TIME"
         if result is False:
-            log(f"⚠️ 第 {attempt} 轮失败（CF未通过或POST未触发）")
+            log(f"⚠️ 第 {attempt} 轮失败")
         else:
             log(f"✅ 第 {attempt} 轮 Create Invoice POST 已触发")
 
-        # 短轮询自动跳转
         log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒...")
         auto_url = None
         for _ in range(NAV_POLL_SECONDS):
@@ -704,10 +715,6 @@ def renew_service(page, service_url):
                     log(f"✅ 第 {idx+1} 个支付成功")
                     paid_ok = True
                     break
-                elif r is False:
-                    log(f"⚠️ 第 {idx+1} 个不是真发票，继续")
-                else:
-                    log(f"⚠️ 第 {idx+1} 个是真发票但点击失败，继续")
 
         if paid_ok:
             log(f"✅ 第 {attempt} 轮续期成功")
@@ -741,6 +748,19 @@ def process_account(identifier, email, password, cookie_value, browser):
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
+
+    # 监听 CF 相关请求，用于诊断
+    def on_request(req):
+        u = req.url or ""
+        if "challenges.cloudflare.com" in u or "turnstile" in u:
+            log(f"📡 [请求] {req.method} {u[:120]}")
+    page.on("request", on_request)
+
+    def on_requestfailed(req):
+        u = req.url or ""
+        if "challenges.cloudflare.com" in u or "turnstile" in u:
+            log(f"❌ [请求失败] {req.method} {u[:120]}  原因: {req.failure}")
+    page.on("requestfailed", on_requestfailed)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
