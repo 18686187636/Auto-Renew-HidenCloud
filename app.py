@@ -22,7 +22,7 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF = 5
-CF_TURNSTILE_TIMEOUT  = 20
+CF_TURNSTILE_TIMEOUT  = 30  # 增加超时时间
 NAV_POLL_SECONDS      = 30
 WAIT_AFTER_PAY        = 15
 
@@ -131,15 +131,35 @@ def handle_cloudflare(page):
     return False
 
 
-def solve_turnstile_checkbox(page, timeout=20):
+def solve_turnstile_checkbox(page, timeout=30):
+    """优化的 Turnstile 处理，直接检查隐藏 input 的值"""
     iframe_sel = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="cloudflare"], iframe[src*="turnstile"]'
     start = time.time()
+    
     while time.time() - start < timeout:
+        # 优先检查隐藏 input 是否有值
+        try:
+            val = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value")
+            if val and len(val) > 10:
+                log("✅ CF Turnstile response 已填充，验证通过")
+                return True
+        except Exception:
+            pass
+
         frames = page.locator(iframe_sel)
         n = frames.count()
         if n == 0:
-            log("✅ 未检测到 CF iframe")
-            return True
+            time.sleep(2)
+            # 再次检查 input
+            try:
+                val = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value")
+                if val and len(val) > 10:
+                    log("✅ CF Turnstile response 已填充，验证通过")
+                    return True
+            except Exception:
+                pass
+            continue
+
         log(f"🔍 检测到 {n} 个 CF iframe")
         for i in range(n):
             try:
@@ -154,20 +174,31 @@ def solve_turnstile_checkbox(page, timeout=20):
                 page.mouse.move(x, y)
                 time.sleep(0.15)
                 page.mouse.click(x, y)
-                time.sleep(5)
-                if page.locator(iframe_sel).count() == 0:
-                    log("✅ CF 验证通过！")
-                    return True
+                time.sleep(4)  # 等待验证完成
+                
+                # 点击后立即检查 input
+                try:
+                    val = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value")
+                    if val and len(val) > 10:
+                        log("✅ CF Turnstile response 已填充，验证通过")
+                        return True
+                except Exception:
+                    pass
+                    
             except Exception as e:
                 log(f"⚠️ 点击 CF 失败: {e}")
         time.sleep(2)
-    return True
+    
+    log("❌ CF Turnstile 验证超时")
+    return False
 
 
 def close_cookie_consent(page):
+    """强化 Cookie 横幅关闭逻辑"""
     try:
         if page.locator('.fc-consent-root').count() == 0:
             return
+        # 尝试点击按钮
         for sel in [
             'button:has-text("Accept")', 'button:has-text("Accept All")',
             'button:has-text("I agree")', 'button:has-text("Allow")',
@@ -175,11 +206,17 @@ def close_cookie_consent(page):
         ]:
             try:
                 btn = page.locator(sel).first
-                btn.wait_for(state="visible", timeout=1000)
-                btn.click()
-                return
+                if btn.is_visible():
+                    btn.click()
+                    log("🍪 已关闭 Cookie 同意横幅")
+                    time.sleep(1)
+                    return
             except Exception:
                 continue
+        # 如果点击失效，直接移除 DOM
+        page.evaluate("document.querySelector('.fc-consent-root')?.remove()")
+        log("🍪 已通过 JS 移除 Cookie 同意横幅")
+        time.sleep(1)
     except Exception:
         pass
 
@@ -281,7 +318,6 @@ def get_due_date(page, service_url):
 
 
 def get_unpaid_invoice_urls(page):
-    """访问 /invoices?where=unpaid，提取所有未付发票 URL（按页面顺序）"""
     log(f"🔍 访问未付发票列表: {UNPAID_INVOICES_URL}")
     try:
         page.goto(UNPAID_INVOICES_URL, wait_until="domcontentloaded", timeout=60000)
@@ -302,7 +338,6 @@ def get_unpaid_invoice_urls(page):
     except Exception:
         pass
 
-    # 优先从含 "Unpaid" 的行提取链接
     urls = []
     try:
         rows = page.locator('tr, div').filter(has_text=re.compile(r'\bUnpaid\b', re.I))
@@ -324,7 +359,6 @@ def get_unpaid_invoice_urls(page):
     except Exception as e:
         log(f"⚠️ 定位 Unpaid 行失败: {e}")
 
-    # 兜底：从 HTML 里提取所有发票链接
     if not urls:
         html = page.content()
         found = re.findall(r'href="(/payment/invoice/[a-f0-9\-]{20,})"', html)
@@ -340,7 +374,6 @@ def get_unpaid_invoice_urls(page):
 
 
 def has_real_pay_button(page):
-    """判断发票页是否有真正的 Pay 按钮"""
     try:
         pay_btn = page.locator('form[action*="/payment/invoice/"][action$="/pay"] button[type="submit"]')
         if pay_btn.count() > 0:
@@ -354,13 +387,6 @@ def has_real_pay_button(page):
 
 
 def try_pay_invoice(page, invoice_url):
-    """
-    访问发票页，尝试点击 Pay。
-    返回：
-      True  → 支付成功
-      False → 不是真发票页（跳过）
-      None  → 是真发票页但支付失败
-    """
     log(f"🔗 访问: {invoice_url}")
     try:
         if page.url != invoice_url:
@@ -376,7 +402,7 @@ def try_pay_invoice(page, invoice_url):
     title = page.title()
     log(f"📝 页面 Title: {title}, URL: {page.url}")
 
-    # 新增：跳转到发票页后立即截图
+    # 跳转到发票页后立即截图
     try:
         page.screenshot(path="invoice_redirected.png", full_page=True)
         with open("invoice_redirected.html", "w", encoding="utf-8") as f:
@@ -510,7 +536,9 @@ def renew_service(page, service_url):
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
     log("🔒 处理 CF Turnstile...")
-    solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
+    if not solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
+        log("❌ CF Turnstile 验证失败，无法创建发票")
+        return False
 
     log(f"🔍 点击前 URL: {page.url}")
 
@@ -537,7 +565,7 @@ def renew_service(page, service_url):
                 log(f"❌ 点击 Create Invoice 失败: {e}")
                 return False
 
-    # 新增：点击 Create Invoice 后立即截图
+    # 点击 Create Invoice 后立即截图
     try:
         time.sleep(1)
         page.screenshot(path="after_create_invoice_click_immediate.png", full_page=True)
@@ -546,6 +574,16 @@ def renew_service(page, service_url):
         log("📸 已保存：点击 Create Invoice 后立即截图")
     except Exception as e:
         log(f"⚠️ 点击 Create Invoice 后立即截图失败: {e}")
+
+    # 检查是否出现 CF 错误
+    time.sleep(3)
+    try:
+        body_text = page.locator("body").inner_text()
+        if "cf-turnstile-response" in body_text or "Error!" in body_text:
+            log("❌ 检测到错误：cf-turnstile-response field is required，CF 验证未通过或未提交")
+            return False
+    except Exception:
+        pass
 
     # 短轮询
     log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
@@ -566,7 +604,7 @@ def renew_service(page, service_url):
             break
         time.sleep(1)
 
-    # 新增/替换：短轮询结束，跳转后截图
+    # 跳转后截图
     try:
         page.screenshot(path="after_create_invoice_redirect.png", full_page=True)
         with open("after_create_invoice_redirect.html", "w", encoding="utf-8") as f:
@@ -578,14 +616,12 @@ def renew_service(page, service_url):
     # === 支付处理 ===
     paid_ok = False
 
-    # 情况 1：自动跳转
     if auto_url:
         log("🚀 自动跳转到发票页，直接处理")
         result = try_pay_invoice(page, auto_url)
         if result is True:
             paid_ok = True
 
-    # 情况 2：去未付发票列表
     if not paid_ok:
         log("⏳ 等待 5 秒让后端生成发票...")
         time.sleep(5)
@@ -595,7 +631,6 @@ def renew_service(page, service_url):
             log("❌ 未付发票列表为空")
             return False
 
-        # 遍历所有未付发票，找到第一个能支付的
         for idx, url in enumerate(unpaid_urls):
             log(f"🔎 尝试第 {idx+1}/{len(unpaid_urls)} 个未付发票")
             result = try_pay_invoice(page, url)
@@ -614,7 +649,6 @@ def renew_service(page, service_url):
         log("❌ 所有未付发票都尝试失败")
         return False
 
-    # === 回服务页确认 ===
     log("🔍 返回服务页确认状态...")
     time.sleep(3)
     try:
