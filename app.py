@@ -21,18 +21,11 @@ REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY els
 INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
-CF_IFRAME_SEL = (
-    'iframe[src*="challenges.cloudflare.com"], '
-    'iframe[title*="cloudflare"], '
-    'iframe[src*="turnstile"], '
-    'iframe[src*="challenge-platform"], '
-    'iframe[src*="cf-chl"]'
-)
-
 WAIT_RENDER_BEFORE_CF = 5
 WAIT_AFTER_PAY        = 15
 NAV_POLL_SECONDS      = 20
-CLICK_MAX_ATTEMPTS    = 5
+CLICK_MAX_ATTEMPTS    = 6
+WAIT_AFTER_CLICK      = 10
 
 
 def log(message):
@@ -96,128 +89,6 @@ def send_telegram_notification(status, old_due, new_due, email):
         return False
 
 
-def mouse_click_element(page, locator, label=""):
-    try:
-        box = locator.bounding_box()
-        if not box:
-            return False
-        x = box["x"] + box["width"] / 2
-        y = box["y"] + box["height"] / 2
-        log(f"🖱️ 物理点击 {label} ({x:.0f}, {y:.0f})")
-        page.mouse.move(x - random.uniform(40, 80), y - random.uniform(20, 40))
-        time.sleep(random.uniform(0.15, 0.35))
-        page.mouse.move(x, y)
-        time.sleep(random.uniform(0.08, 0.18))
-        page.mouse.click(x, y)
-        return True
-    except Exception as e:
-        log(f"⚠️ 物理点击 {label} 失败: {e}")
-        return False
-
-
-def get_turnstile_token_len(page):
-    try:
-        return page.evaluate("""
-            () => {
-                const inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
-                if (inputs.length === 0) return -1;
-                let maxLen = 0;
-                inputs.forEach(i => { if (i.value && i.value.length > maxLen) maxLen = i.value.length; });
-                return maxLen;
-            }
-        """)
-    except Exception:
-        return -1
-
-
-def diagnose_turnstile(page):
-    try:
-        diag = page.evaluate("""
-            () => {
-                const cs = document.querySelectorAll('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]');
-                const out = [];
-                cs.forEach((c, idx) => {
-                    const ifr = c.querySelector('iframe');
-                    const r = c.getBoundingClientRect();
-                    out.push({
-                        idx: idx,
-                        hasIframe: !!ifr,
-                        x: Math.round(r.x), y: Math.round(r.y),
-                        w: Math.round(r.width), h: Math.round(r.height),
-                        visible: r.width > 0 && r.height > 0
-                    });
-                });
-                return out;
-            }
-        """)
-        log(f"🔍 诊断: {diag}")
-        return diag
-    except Exception as e:
-        log(f"⚠️ 诊断失败: {e}")
-        return []
-
-
-def try_solve_cf(page, max_wait=20):
-    """
-    尝试处理 CF：有 iframe 就点 iframe，有容器就点容器。
-    【不阻断流程】—— 无论结果如何都返回，让 Create Invoice 继续。
-    """
-    log(f"🔒 尝试处理 CF（最多 {max_wait} 秒，不阻断流程）...")
-    start = time.time()
-    attempt = 0
-
-    while time.time() - start < max_wait:
-        attempt += 1
-
-        # token 出现 → 提前退出
-        if get_turnstile_token_len(page) > 0:
-            log(f"✅ token 已生成（长度 {get_turnstile_token_len(page)}）")
-            return
-
-        # 尝试点 iframe
-        try:
-            iframe_n = page.locator(CF_IFRAME_SEL).count()
-            if iframe_n > 0:
-                box = page.locator(CF_IFRAME_SEL).first.bounding_box()
-                if box and box["width"] > 0:
-                    x = box["x"] + 30
-                    y = box["y"] + box["height"] / 2
-                    log(f"🖱️ 尝试 {attempt}: 点 iframe ({x:.0f}, {y:.0f})")
-                    page.mouse.click(x, y)
-                    time.sleep(3)
-                    continue
-        except Exception:
-            pass
-
-        # 尝试点容器左侧
-        try:
-            container = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').first
-            if container.count() > 0:
-                box = container.bounding_box()
-                if box and box["width"] > 0:
-                    # 容器可能很宽（576），Try 多个 X 坐标
-                    xs = [
-                        box["x"] + 20,
-                        box["x"] + 30,
-                        box["x"] + 50,
-                        box["x"] + box["width"] / 2,
-                    ]
-                    y = box["y"] + box["height"] / 2
-                    x = random.choice(xs)
-                    log(f"🖱️ 尝试 {attempt}: 点容器 ({x:.0f}, {y:.0f}) size=({box['width']:.0f}x{box['height']:.0f})")
-                    page.mouse.move(x - 20, y - 10)
-                    time.sleep(0.15)
-                    page.mouse.click(x, y)
-                    time.sleep(3)
-                    continue
-        except Exception:
-            pass
-
-        time.sleep(2)
-
-    log("⚠️ CF 处理时间到，继续流程（让前端自己处理 token）")
-
-
 def close_cookie_consent(page):
     try:
         if page.locator('.fc-consent-root').count() == 0:
@@ -236,6 +107,60 @@ def close_cookie_consent(page):
                 continue
     except Exception:
         pass
+
+
+def get_turnstile_token_len(page):
+    try:
+        return page.evaluate("""
+            () => {
+                const inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
+                if (inputs.length === 0) return -1;
+                let maxLen = 0;
+                inputs.forEach(i => { if (i.value && i.value.length > maxLen) maxLen = i.value.length; });
+                return maxLen;
+            }
+        """)
+    except Exception:
+        return -1
+
+
+def try_solve_cf(page, max_wait=30):
+    """尝试处理 CF，不阻断流程"""
+    log(f"🔒 尝试处理 CF（最多 {max_wait} 秒）...")
+    start = time.time()
+    attempt = 0
+
+    while time.time() - start < max_wait:
+        attempt += 1
+        tl = get_turnstile_token_len(page)
+        if tl > 0:
+            log(f"✅ token 已生成（长度 {tl}）")
+            return True
+
+        # 点容器左侧
+        try:
+            container = page.locator('div.cf-turnstile, [data-sitekey], div[class*="turnstile"]').first
+            if container.count() > 0:
+                box = container.bounding_box()
+                if box and box["width"] > 0:
+                    x = box["x"] + random.uniform(22, 35)
+                    y = box["y"] + box["height"] / 2
+                    log(f"🖱️ 尝试 {attempt}: 点容器 ({x:.0f}, {y:.0f})")
+                    page.mouse.move(x - random.uniform(20, 50), y - random.uniform(10, 25))
+                    time.sleep(0.2)
+                    page.mouse.move(x, y)
+                    time.sleep(0.15)
+                    page.mouse.click(x, y)
+                    time.sleep(3)
+                    continue
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+    tl = get_turnstile_token_len(page)
+    log(f"⚠️ CF 处理结束，token={tl}")
+    return tl > 0
 
 
 def login(page, email, password, cookie_value):
@@ -330,8 +255,12 @@ def get_due_date(page, service_url):
 
 def click_create_invoice_with_retry(page, create_btn):
     """
-    多次点击 Create Invoice，直到捕获到 POST /renew。
-    每次点击后等 8 秒。
+    多种方式交替点击 Create Invoice：
+      1. Playwright element.click()（自动等稳定）
+      2. element.click(force=True)
+      3. element.evaluate("el => el.click()")
+      4. form.requestSubmit()
+    每次点击后等 WAIT_AFTER_CLICK 秒捕获 POST /renew
     """
     state = {"posted": False, "status": 0, "location": ""}
 
@@ -350,37 +279,52 @@ def click_create_invoice_with_retry(page, create_btn):
 
     page.on("response", on_response)
 
+    # 诊断按钮状态
+    try:
+        log(f"🔍 Create Invoice 状态: disabled={create_btn.is_disabled()}, visible={create_btn.is_visible()}")
+    except Exception:
+        pass
+
+    methods = [
+        ("playwright-click", lambda: create_btn.click(timeout=5000)),
+        ("playwright-force", lambda: create_btn.click(timeout=5000, force=True)),
+        ("js-click",         lambda: create_btn.evaluate("el => el.click()")),
+        ("form-submit",      lambda: create_btn.evaluate("""
+            el => {
+                const f = el.form || el.closest('form');
+                if (f && f.requestSubmit) { f.requestSubmit(el); return true; }
+                return false;
+            }
+        """)),
+    ]
+
     for attempt in range(1, CLICK_MAX_ATTEMPTS + 1):
-        log(f"🖱️ 第 {attempt}/{CLICK_MAX_ATTEMPTS} 次点击 Create Invoice...")
+        method = methods[(attempt - 1) % len(methods)]
+        method_name, method_fn = method
+        log(f"🖱️ 第 {attempt}/{CLICK_MAX_ATTEMPTS} 次点击（方法: {method_name}）...")
+
         state["posted"] = False
 
-        # 检查按钮是否 disabled
         try:
-            if create_btn.is_disabled():
-                log("⚠️ Create Invoice disabled，等 3 秒...")
-                time.sleep(3)
-        except Exception:
-            pass
-
-        clicked = mouse_click_element(page, create_btn, f"CreateInvoice(尝试{attempt})")
-        if not clicked:
+            # 先 hover
             try:
-                create_btn.click(timeout=5000)
+                create_btn.hover(timeout=3000)
+                time.sleep(0.3)
             except Exception:
-                try:
-                    create_btn.evaluate("el => el.click()")
-                except Exception as e:
-                    log(f"⚠️ 所有点击方式失败: {e}")
+                pass
 
-        # 等 8 秒捕获 POST
-        for i in range(16):
+            method_fn()
+        except Exception as e:
+            log(f"⚠️ 点击方法 {method_name} 失败: {e}")
+
+        # 等 WAIT_AFTER_CLICK 秒捕获 POST
+        for i in range(WAIT_AFTER_CLICK * 2):
             time.sleep(0.5)
             if state["posted"]:
-                log(f"✅ 第 {attempt} 次点击后捕获到 POST /renew（{state['status']}）")
+                log(f"✅ 第 {attempt} 次点击（{method_name}）成功触发 POST /renew")
                 return True, state["status"], state["location"]
 
-        log(f"⚠️ 第 {attempt} 次点击后未捕获 POST /renew，准备重试...")
-        time.sleep(2)
+        log(f"⚠️ 第 {attempt} 次（{method_name}）未捕获 POST /renew")
 
     log(f"❌ {CLICK_MAX_ATTEMPTS} 次点击均未触发 POST /renew")
     return False, 0, ""
@@ -502,15 +446,26 @@ def try_pay_invoice(page, invoice_url):
 
                 if text == "Pay" or re.match(r"^Pay\s*[€$£]?\d", text):
                     log(f"✅ 锁定: {text!r}")
-                    if not mouse_click_element(page, btn, f"Pay({text})"):
+                    # 用多种方式点击
+                    clicked = False
+                    try:
+                        btn.click(timeout=5000)
+                        clicked = True
+                    except Exception as e:
+                        log(f"⚠️ Playwright click 失败: {e}")
+                    if not clicked:
                         try:
-                            btn.click(timeout=5000)
+                            btn.click(timeout=5000, force=True)
+                            clicked = True
                         except Exception:
-                            try:
-                                btn.evaluate("el => el.click()")
-                            except Exception as e:
-                                log(f"❌ 点击失败: {e}")
-                                continue
+                            pass
+                    if not clicked:
+                        try:
+                            btn.evaluate("el => el.click()")
+                            clicked = True
+                        except Exception as e:
+                            log(f"❌ 点击失败: {e}")
+                            continue
 
                     log(f"⏳ 已点击 Pay，等待 {WAIT_AFTER_PAY} 秒...")
                     time.sleep(WAIT_AFTER_PAY)
@@ -561,8 +516,10 @@ def click_renew_and_create(page, service_url, attempt=1):
             renew_btn.wait_for(state="visible", timeout=10000)
             renew_btn.scroll_into_view_if_needed()
             log(f"🖱️ 点击 'Renew'（第 {i+1} 次）")
-            if not mouse_click_element(page, renew_btn, "Renew"):
-                renew_btn.click()
+            try:
+                renew_btn.click(timeout=5000)
+            except Exception:
+                renew_btn.click(timeout=5000, force=True)
             time.sleep(2)
 
             body_lower = page.locator("body").inner_text().lower()
@@ -591,10 +548,8 @@ def click_renew_and_create(page, service_url, attempt=1):
     log(f"⏳ 等待 {WAIT_RENDER_BEFORE_CF} 秒让弹窗渲染...")
     time.sleep(WAIT_RENDER_BEFORE_CF)
 
-    # === 尝试处理 CF（不阻断）===
-    log("🔍 弹窗内 Turnstile 状态诊断:")
-    diagnose_turnstile(page)
-    try_solve_cf(page, max_wait=20)
+    # 尝试处理 CF，不阻断
+    try_solve_cf(page, max_wait=30)
 
     try:
         page.screenshot(path=f"before_create_invoice_{attempt}.png", full_page=True)
@@ -604,7 +559,7 @@ def click_renew_and_create(page, service_url, attempt=1):
     except Exception:
         pass
 
-    # === 核心：无论 CF 状态如何，都点击 Create Invoice ===
+    # 核心：多种方式点击 Create Invoice
     posted, status, location = click_create_invoice_with_retry(page, create_btn)
     if not posted:
         log("⚠️ 未能触发 POST /renew")
