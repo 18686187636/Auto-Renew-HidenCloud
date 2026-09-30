@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-          pip install camoufox requests 'requests[socks]'
+          pip install "camoufox[geoip]" requests 'requests[socks]'
           python -m camoufox fetch
 
       - name: ⚙ 设置代理 (sing-box)
