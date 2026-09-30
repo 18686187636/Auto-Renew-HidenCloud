@@ -51,7 +51,7 @@ jobs:
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
-      - name: 📤 上传诊断截图、HTML 和录屏
+      - name: 📤 上传诊断截图和 HTML
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -59,7 +59,6 @@ jobs:
           path: |
             *.png
             *.html
-            videos/**
           if-no-files-found: ignore
           retention-days: 7
 
