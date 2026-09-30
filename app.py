@@ -19,13 +19,16 @@ PROXY_SERVER = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
 INVOICE_URL_KEYWORDS = ("/payment/invoice/",)
+RENEW_URL_KEYWORDS   = ("/renew",)
 UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF   = 20
-CF_IFRAME_WAIT_SECONDS  = 10     # 缩短：这个站点主要靠 .cf-turnstile div
-CF_TURNSTILE_TIMEOUT    = 40
-NAV_POLL_SECONDS        = 60
+CF_IFRAME_WAIT_SECONDS  = 10
+CF_TURNSTILE_TIMEOUT    = 25     # 缩短：给自动 token 生成留时间，不再死磕点击
+CF_AUTO_WAIT_SECONDS    = 15     # 等待 CF 自动完成挑战
+NAV_POLL_SECONDS        = 30
 WAIT_AFTER_PAY          = 15
+WAIT_AFTER_RENEW_RESP   = 15     # 收到 302 后等待服务端处理
 ACCOUNT_INTERVAL_SEC    = 90
 
 CF_IFRAME_SEL = (
@@ -148,10 +151,6 @@ def click_with_fallback(page, locator, label=""):
 # ---------- Accept 按钮 ----------
 
 def click_accept_if_present(page):
-    """
-    点击弹窗/页面里可能出现的 Accept 按钮。
-    只在元素可见且 enabled 时才点，避免误触其它 "Accept" 文本。
-    """
     selectors = [
         'button:has-text("Accept All")',
         'button:has-text("Accept")',
@@ -197,7 +196,6 @@ def wait_cf_iframe(page, timeout=CF_IFRAME_WAIT_SECONDS):
 
 
 def _turnstile_token_ready(page):
-    """检查 Turnstile 响应 token 是否已生成。"""
     try:
         val = page.evaluate("""() => {
             const sels = [
@@ -217,11 +215,6 @@ def _turnstile_token_ready(page):
 
 
 def _js_click_turnstile_shadow(page):
-    """
-    穿透 shadow DOM 找 Turnstile checkbox 并点击。
-    Turnstile 结构通常是 <div class="cf-turnstile">...<input type="checkbox">...
-    但 checkbox 可能存在于嵌套 shadow root 中。
-    """
     try:
         return page.evaluate("""() => {
             const tryClick = (el) => {
@@ -257,7 +250,6 @@ def _js_click_turnstile_shadow(page):
                 const role = el.getAttribute ? (el.getAttribute('role') || '') : '';
                 const type = el.getAttribute ? (el.getAttribute('type') || '') : '';
 
-                // Turnstile checkbox 特征
                 const isTSCheckbox =
                     (tag === 'input' && type === 'checkbox') ||
                     role === 'checkbox' ||
@@ -265,7 +257,6 @@ def _js_click_turnstile_shadow(page):
                     cls.includes('cb-l') ||
                     (cls.includes('turnstile') && (tag === 'input' || tag === 'label'));
 
-                // 必须位于 .cf-turnstile 或 #cf-chl-widget-* 容器内
                 let inCfWidget = false;
                 let p = el;
                 while (p) {
@@ -295,20 +286,26 @@ def _js_click_turnstile_shadow(page):
 
 def click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
     """
-    点击 Turnstile 小方框：
-      1) 优先 JS 穿透 shadow DOM
-      2) 检查响应 token
-      3) 兜底坐标点击 .cf-turnstile 区域左侧
+    优先等待 token 自动生成；未生成时再尝试 JS 穿透点击 + 坐标兜底。
     """
-    log("🔒 开始点击 Turnstile checkbox...")
+    log("🔒 尝试处理 Turnstile（先等自动 token）...")
     start = time.time()
-    attempt = 0
 
     while time.time() - start < timeout:
-        attempt += 1
-        log(f"🔁 第 {attempt} 次尝试 (已用 {int(time.time()-start)}s)")
+        if _turnstile_token_ready(page):
+            log("✅ Turnstile token 已生成（自动）")
+            return True
+        try:
+            if page.locator(CF_DIV_SEL).count() == 0:
+                log("✅ .cf-turnstile 容器已消失")
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
 
-        # 1) JS 穿透点击
+    log(f"⏳ 自动 token 未生成，尝试 JS 穿透点击（{timeout}s 内）...")
+    click_start = time.time()
+    while time.time() - click_start < timeout:
         res = _js_click_turnstile_shadow(page)
         if res:
             if res.get("clicked"):
@@ -316,26 +313,19 @@ def click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
             else:
                 hits = res.get("hits") or []
                 if hits:
-                    log(f"🔍 找到候选元素但点击失败: {hits}")
+                    log(f"🔍 候选元素但点击失败: {hits}")
                 else:
-                    log("ℹ️ JS 未找到 Turnstile checkbox 候选")
-
+                    log("ℹ️ JS 未找到候选")
         time.sleep(3)
-
-        # 2) 检查 token
         if _turnstile_token_ready(page):
-            log("✅ Turnstile token 已生成，验证通过")
+            log("✅ 点击后 token 已生成")
             return True
-
-        # 3) 检查容器是否消失
         try:
             if page.locator(CF_DIV_SEL).count() == 0:
-                log("✅ .cf-turnstile 容器已消失")
                 return True
         except Exception:
             pass
-
-        # 4) 兜底：坐标点击 .cf-turnstile 左侧
+        # 坐标兜底
         try:
             loc = page.locator(CF_DIV_SEL).first
             if loc.count() > 0:
@@ -353,24 +343,21 @@ def click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT):
                     if _turnstile_token_ready(page):
                         log("✅ 坐标点击后 token 已生成")
                         return True
-        except Exception as e:
-            log(f"⚠️ 坐标点击异常: {e}")
-
+        except Exception:
+            pass
         time.sleep(2)
 
-    log("⚠️ Turnstile 点击超时")
+    log("⚠️ Turnstile 处理超时")
     return False
 
 
 def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
-    """兼容旧调用：处理 CF iframe 场景。"""
     log("🔒 尝试在 CF iframe 内点击...")
     start = time.time()
     while time.time() - start < timeout:
         if page.locator(CF_IFRAME_SEL).count() == 0:
             log("✅ CF iframe 已消失")
             return True
-
         for f in page.frames:
             furl = f.url or ""
             if "challenges.cloudflare.com" in furl or "turnstile" in furl:
@@ -395,11 +382,22 @@ def js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT):
 
 
 def handle_cloudflare(page):
-    if page.locator(CF_IFRAME_SEL).count() == 0 and page.locator(CF_DIV_SEL).count() == 0:
+    has_div = False
+    has_iframe = False
+    try:
+        has_div = page.locator(CF_DIV_SEL).count() > 0
+    except Exception:
+        pass
+    try:
+        has_iframe = page.locator(CF_IFRAME_SEL).count() > 0
+    except Exception:
+        pass
+
+    if not has_div and not has_iframe:
         return True
     log("⚠️ 页面检测到 Cloudflare 验证...")
-    if page.locator(CF_DIV_SEL).count() > 0:
-        return click_turnstile_checkbox(page, timeout=60)
+    if has_div:
+        return click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
     return js_click_turnstile(page, timeout=60)
 
 
@@ -748,7 +746,7 @@ def renew_service(page, service_url, tag="acc"):
     else:
         log("ℹ️ 未找到 Accept 按钮")
 
-    # === 检测 CF：优先 .cf-turnstile div，其次 iframe ===
+    # === 检测 CF ===
     log("🔒 检查弹窗内 CF...")
     has_div = False
     has_iframe = False
@@ -761,23 +759,22 @@ def renew_service(page, service_url, tag="acc"):
     except Exception:
         pass
 
-    if has_div:
-        log("⚠️ 检测到 .cf-turnstile 容器，开始点击 checkbox")
+    if _turnstile_token_ready(page):
+        log("✅ 点击前 Turnstile token 已生成")
+    elif has_div:
+        log("⚠️ 检测到 .cf-turnstile 容器，等待 token 或点击")
         click_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
     elif has_iframe:
-        log("⚠️ 检测到 CF iframe，开始点击")
-        js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT)
-    elif wait_cf_iframe(page, timeout=CF_IFRAME_WAIT_SECONDS):
-        log("⚠️ 等待期内出现 CF iframe，开始点击")
+        log("⚠️ 检测到 CF iframe")
         js_click_turnstile(page, timeout=CF_TURNSTILE_TIMEOUT)
     else:
-        log("ℹ️ 未检测到 CF")
+        log("ℹ️ 未检测到 CF，等待自动挑战完成")
+        time.sleep(CF_AUTO_WAIT_SECONDS)
 
-    # 再次检查 token 状态
     if _turnstile_token_ready(page):
-        log("✅ 点击前确认 Turnstile token 已生成")
+        log("✅ 点击前 Turnstile token 已生成")
     else:
-        log("⚠️ 点击前 Turnstile token 仍未生成")
+        log("⚠️ 点击前 Turnstile token 仍未生成，仍尝试提交")
 
     log(f"🔍 点击前 URL: {page.url}")
 
@@ -791,72 +788,20 @@ def renew_service(page, service_url, tag="acc"):
         page.screenshot(path=f"before_click_viewport_{tag}.png", full_page=False)
         log("📸 已保存视口截图 before_click_viewport")
 
-        modal_saved = False
         for msel in ['[role="dialog"]', '.modal', '.fixed.inset-0', 'div[class*="modal"]']:
             try:
                 modal = page.locator(msel).first
                 if modal.count() > 0 and modal.is_visible():
                     modal.screenshot(path=f"before_click_modal_{tag}.png")
                     log(f"📸 已保存弹窗截图 ({msel})")
-                    modal_saved = True
                     break
             except Exception:
                 continue
-        if not modal_saved:
-            log("ℹ️ 未定位到弹窗元素，跳过弹窗截图")
 
         try:
             log(f"🔍 create_btn visible={create_btn.is_visible()}, enabled={create_btn.is_enabled()}")
         except Exception:
             pass
-
-        try:
-            iframes = page.locator('iframe')
-            n_if = iframes.count()
-            log(f"🔍 页面 iframe 数: {n_if}")
-            for i in range(min(n_if, 10)):
-                try:
-                    src = iframes.nth(i).get_attribute('src') or ''
-                    title = iframes.nth(i).get_attribute('title') or ''
-                    log(f"   iframe[{i}] src={src[:120]} title={title}")
-                except Exception:
-                    continue
-        except Exception as e:
-            log(f"⚠️ 枚举 iframe 失败: {e}")
-
-        try:
-            cf_hint = page.evaluate("""() => {
-                const hits = [];
-                const scan = (root, path) => {
-                    try {
-                        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-                        let n = walker.currentNode;
-                        while (n) {
-                            const id = n.id || '';
-                            const cls = (n.className && n.className.toString) ? n.className.toString() : '';
-                            const tag = n.tagName ? n.tagName.toLowerCase() : '';
-                            if (id.includes('turnstile') || cls.includes('turnstile') ||
-                                id.includes('cf-') || cls.includes('cf-') ||
-                                tag === 'iframe') {
-                                hits.push((path + '>' + tag + '#' + id + '.' + cls).slice(0, 160));
-                            }
-                            if (n.shadowRoot) scan(n.shadowRoot, path + '>' + tag + '[shadow]');
-                            n = walker.nextNode();
-                        }
-                    } catch (e) {}
-                };
-                scan(document.body, 'body');
-                return hits.slice(0, 20);
-            }""")
-            if cf_hint:
-                log("🔍 DOM 中疑似 CF/turnstile 元素:")
-                for h in cf_hint:
-                    log(f"   {h}")
-            else:
-                log("ℹ️ DOM 中未发现 turnstile/cf-* 痕迹")
-        except Exception as e:
-            log(f"⚠️ 扫描 shadow DOM 失败: {e}")
-
     except Exception as e:
         log(f"⚠️ 点击前截图失败: {e}")
 
@@ -875,11 +820,19 @@ def renew_service(page, service_url, tag="acc"):
         pass
 
     log("🖱️ 点击 'Create Invoice'...")
-    if not click_with_fallback(page, create_btn, "Create Invoice"):
+    first_click_ok = click_with_fallback(page, create_btn, "Create Invoice")
+    if not first_click_ok:
         log("❌ 点击 Create Invoice 失败")
         return False
 
-    time.sleep(3)
+    # === 等待并检查响应 / 弹窗状态 ===
+    time.sleep(5)
+
+    def _has_renew_redirect():
+        return any(
+            300 <= s < 400 and any(k in u for k in RENEW_URL_KEYWORDS)
+            for s, u in net_log
+        )
 
     modal_still_open = False
     try:
@@ -888,43 +841,97 @@ def renew_service(page, service_url, tag="acc"):
         modal_still_open = False
     log(f"🔍 点击后弹窗是否仍在: {modal_still_open}")
 
+    body_lower = ""
     try:
         body_lower = page.locator("body").inner_text().lower()
-        for kw in ["captcha", "verification failed", "try again", "please complete", "error", "failed", "required"]:
-            if kw in body_lower:
-                log(f"⚠️ 页面出现疑似错误关键词: {kw}")
-                break
     except Exception:
         pass
 
-    # 若报 captcha 且弹窗仍在，再补一次 CF 处理 + 重试点击
-    if modal_still_open:
+    captcha_err = ("captcha" in body_lower) or ("verification" in body_lower and "failed" in body_lower)
+
+    if _has_renew_redirect():
+        log("🚀 已收到 /renew 的 302 重定向，续期请求已提交")
+        # 等服务器处理
+        log(f"⏳ 等待 {WAIT_AFTER_RENEW_RESP} 秒让服务端处理...")
+        time.sleep(WAIT_AFTER_RENEW_RESP)
+
+        log("🔍 返回服务页确认状态...")
         try:
-            body_lower = page.locator("body").inner_text().lower()
-        except Exception:
-            body_lower = ""
-        if "captcha" in body_lower or "verification" in body_lower:
-            log("🔁 检测到 captcha 错误，再次尝试 CF + 重试点击...")
-            click_accept_if_present(page)
-            time.sleep(1)
-            if page.locator(CF_DIV_SEL).count() > 0:
-                click_turnstile_checkbox(page, timeout=30)
-            elif page.locator(CF_IFRAME_SEL).count() > 0:
-                js_click_turnstile(page, timeout=30)
-            time.sleep(2)
-            try:
+            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            close_cookie_consent(page)
+        except Exception as e:
+            log(f"⚠️ 返回服务页失败: {e}")
+        return True
+
+    if not modal_still_open:
+        log("✅ 弹窗已关闭，视为提交成功")
+        log(f"⏳ 等待 {WAIT_AFTER_RENEW_RESP} 秒让服务端处理...")
+        time.sleep(WAIT_AFTER_RENEW_RESP)
+        try:
+            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            close_cookie_consent(page)
+        except Exception as e:
+            log(f"⚠️ 返回服务页失败: {e}")
+        return True
+
+    # 弹窗还在 + captcha 错误 → 尝试修复 CF 并重试一次
+    if captcha_err:
+        log("🔁 检测到 captcha 错误，再次尝试 CF + 重试点击...")
+        click_accept_if_present(page)
+        time.sleep(1)
+        if page.locator(CF_DIV_SEL).count() > 0:
+            click_turnstile_checkbox(page, timeout=20)
+        elif page.locator(CF_IFRAME_SEL).count() > 0:
+            js_click_turnstile(page, timeout=20)
+        time.sleep(2)
+        try:
+            if create_btn.is_visible():
                 create_btn.click(timeout=5000)
                 log("✅ 重试点击 Create Invoice")
-            except Exception as e:
-                log(f"⚠️ 重试点击失败: {e}")
-            time.sleep(3)
+                time.sleep(5)
+        except Exception as e:
+            log(f"ℹ️ 重试点击未成功（可能弹窗已关闭）: {e}")
 
+        # 再次检查响应 / 弹窗
+        if _has_renew_redirect():
+            log("🚀 重试后收到 /renew 302，续期成功")
+            time.sleep(WAIT_AFTER_RENEW_RESP)
+            try:
+                page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                handle_cloudflare(page)
+                close_cookie_consent(page)
+            except Exception as e:
+                log(f"⚠️ 返回服务页失败: {e}")
+            return True
+
+        try:
+            if not create_btn.is_visible():
+                log("✅ 重试后弹窗关闭，视为成功")
+                time.sleep(WAIT_AFTER_RENEW_RESP)
+                try:
+                    page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    handle_cloudflare(page)
+                    close_cookie_consent(page)
+                except Exception as e:
+                    log(f"⚠️ 返回服务页失败: {e}")
+                return True
+        except Exception:
+            pass
+
+    # 打印网络日志
     time.sleep(2)
     for status, url in net_log:
         log(f"📡 请求: {status} {url}")
     if any(s >= 400 for s, _ in net_log):
-        log("⚠️ 存在 4xx/5xx 响应，后端可能拒绝了请求")
+        log("⚠️ 存在 4xx/5xx 响应")
 
+    # === 短轮询自动跳转 ===
     log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
     auto_url = None
     for i in range(NAV_POLL_SECONDS):
@@ -968,8 +975,15 @@ def renew_service(page, service_url, tag="acc"):
                 break
 
         if not unpaid_urls:
-            log("❌ 未付发票列表为空")
-            return False
+            log("❌ 未付发票列表为空，直接回服务页确认 Due Date")
+            try:
+                page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                handle_cloudflare(page)
+                close_cookie_consent(page)
+            except Exception:
+                pass
+            return True  # 让外层对比 Due Date
 
         for idx, url in enumerate(unpaid_urls):
             log(f"🔎 尝试第 {idx+1}/{len(unpaid_urls)} 个未付发票")
@@ -1039,6 +1053,8 @@ def process_account(identifier, email, password, cookie_value, browser):
         elif renew_result is False:
             status = "❌ 续期失败"
         else:
+            # 等待服务端更新后重新获取
+            time.sleep(5)
             new_due = get_due_date(page, service_url)
             log(f"📆 续费后到期时间：{new_due}")
             if new_due != "未知" and new_due == old_due:
@@ -1110,7 +1126,7 @@ def main():
 
                 status, old_due, new_due = process_account(identifier, email, password, cookie, browser)
 
-                if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
+                if status not in ("✅ 续期成功", "⏳ 未到续期时间", "⚠️ 续期后到期时间未变化"):
                     all_success = False
 
                 if idx < total - 1:
