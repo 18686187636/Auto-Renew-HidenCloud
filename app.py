@@ -376,6 +376,15 @@ def try_pay_invoice(page, invoice_url):
     title = page.title()
     log(f"📝 页面 Title: {title}, URL: {page.url}")
 
+    # 新增：跳转到发票页后立即截图
+    try:
+        page.screenshot(path="invoice_redirected.png", full_page=True)
+        with open("invoice_redirected.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log("📸 已保存：跳转后的发票页截图")
+    except Exception as e:
+        log(f"⚠️ 跳转后的发票页截图失败: {e}")
+
     if not has_real_pay_button(page):
         log("⚠️ 该页没有真 Pay 按钮，跳过")
         return False
@@ -528,6 +537,16 @@ def renew_service(page, service_url):
                 log(f"❌ 点击 Create Invoice 失败: {e}")
                 return False
 
+    # 新增：点击 Create Invoice 后立即截图
+    try:
+        time.sleep(1)
+        page.screenshot(path="after_create_invoice_click_immediate.png", full_page=True)
+        with open("after_create_invoice_click_immediate.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log("📸 已保存：点击 Create Invoice 后立即截图")
+    except Exception as e:
+        log(f"⚠️ 点击 Create Invoice 后立即截图失败: {e}")
+
     # 短轮询
     log(f"⏳ 短轮询 {NAV_POLL_SECONDS} 秒，看是否自动跳转...")
     auto_url = None
@@ -547,12 +566,14 @@ def renew_service(page, service_url):
             break
         time.sleep(1)
 
+    # 新增/替换：短轮询结束，跳转后截图
     try:
-        page.screenshot(path="after_create_invoice_click.png", full_page=True)
-        with open("after_create_invoice_click.html", "w", encoding="utf-8") as f:
+        page.screenshot(path="after_create_invoice_redirect.png", full_page=True)
+        with open("after_create_invoice_redirect.html", "w", encoding="utf-8") as f:
             f.write(page.content())
-    except Exception:
-        pass
+        log(f"📸 已保存：跳转后截图，当前 URL={page.url}")
+    except Exception as e:
+        log(f"⚠️ 跳转后截图失败: {e}")
 
     # === 支付处理 ===
     paid_ok = False
