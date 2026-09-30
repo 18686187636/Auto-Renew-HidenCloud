@@ -24,8 +24,8 @@ UNPAID_INVOICES_URL  = f"{BASE_URL}/invoices?where=unpaid"
 
 WAIT_RENDER_BEFORE_CF   = 20
 CF_CLICK_TIMEOUT        = 60
-CF_CHALLENGE_MAX_WAIT   = 90     # 整页 CF 挑战最长等待
-CF_CHALLENGE_POLL       = 3      # 整页挑战轮询间隔
+CF_CHALLENGE_MAX_WAIT   = 90
+CF_CHALLENGE_POLL       = 3
 NAV_POLL_SECONDS        = 30
 WAIT_AFTER_PAY          = 15
 WAIT_AFTER_RENEW_RESP   = 20
@@ -46,7 +46,6 @@ CF_IFRAME_SEL = (
 )
 CF_DIV_SEL = '.cf-turnstile, div[class*="cf-turnstile"], div[id*="cf-chl-widget"]'
 
-# 整页 CF 挑战的标志
 CF_CHALLENGE_TITLE_HINTS = ["just a moment", "moment...", "attention required"]
 CF_CHALLENGE_BODY_HINTS = [
     "security verification",
@@ -73,6 +72,8 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
 Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
 """
 
+
+# ---------- 基础工具 ----------
 
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
@@ -103,10 +104,49 @@ def wait_page_ready(page, extra_wait=PAGE_EXTRA_WAIT, timeout_ms=PAGE_NETWORKIDL
         time.sleep(extra_wait)
 
 
-# ---------- 整页 CF 挑战检测与等待 ----------
+def get_current_ip(proxy_server=None):
+    proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
+    try:
+        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        if resp.status_code == 200:
+            return resp.text.strip()
+        return "获取失败"
+    except Exception as e:
+        log(f"❌ 获取出口IP失败: {e}")
+        return "获取失败"
+
+
+def send_telegram_notification(status, old_due, new_due, email):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("⚠️ Telegram 未配置，跳过通知")
+        return False
+    local_time = time.gmtime(time.time() + 8 * 3600)
+    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+    text = (
+        f"🎉 HidenCloud 续期通知\n\n"
+        f"{status}\n"
+        f"👤 账号: {mask_email(email)}\n"
+        f"📅 续期前到期：{old_due}\n"
+        f"📅 续期后到期：{new_due}\n"
+        f"🕒 续期时间：{now}"
+    )
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    try:
+        resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
+        if resp.status_code == 200:
+            log("✅ Telegram 通知发送成功")
+            return True
+        log(f"❌ Telegram 通知失败: {resp.text}")
+        return False
+    except Exception as e:
+        log(f"❌ Telegram 通知异常: {e}")
+        return False
+
+
+# ---------- 整页 CF 挑战 ----------
 
 def is_cf_challenge_page(page):
-    """判断当前页面是否是 CF 整页挑战页。"""
     try:
         title = (page.title() or "").lower()
     except Exception:
@@ -119,12 +159,10 @@ def is_cf_challenge_page(page):
     except Exception:
         body_text = ""
     body_lower = body_text.lower()
-    # 只有 body 很短时才算挑战页，避免正常页面里偶然出现这些词
     if len(body_text) < 1500:
         for h in CF_CHALLENGE_BODY_HINTS:
             if h in body_lower:
                 return f"body:{h}"
-    # 兜底：检查典型 DOM 元素
     try:
         if page.locator('#challenge-form, #challenge-running, .cf-browser-verification').count() > 0:
             return "dom:cf-challenge"
@@ -134,10 +172,6 @@ def is_cf_challenge_page(page):
 
 
 def wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=""):
-    """
-    被动等待整页 CF 挑战通过。
-    返回 True = 通过，False = 超时。
-    """
     reason = is_cf_challenge_page(page)
     if not reason:
         return True
@@ -149,7 +183,6 @@ def wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=""):
     while time.time() - start < timeout:
         time.sleep(CF_CHALLENGE_POLL)
 
-        # 通过条件 1：title 变化 + body 明显变长
         try:
             title = (page.title() or "").lower()
         except Exception:
@@ -170,7 +203,6 @@ def wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=""):
             log(f"✅ CF 整页挑战已通过 (title={title!r}, body_len={body_len})")
             return True
 
-        # 通过条件 2：URL 变成目标 URL 且不再挑战
         if not still_challenge and "challenge" not in page.url.lower():
             log(f"✅ CF 整页挑战已通过 (URL={page.url}, body_len={body_len})")
             return True
@@ -182,7 +214,7 @@ def wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=""):
     return False
 
 
-# ---------- 弹窗内 Turnstile widget 处理 ----------
+# ---------- 弹窗内 Turnstile widget ----------
 
 def _turnstile_token_ready(page):
     try:
@@ -378,14 +410,10 @@ def solve_cf_and_wait_token(page, timeout=CF_CLICK_TIMEOUT, tag=""):
 
 
 def handle_cloudflare(page, tag=""):
-    """先处理整页挑战，再处理弹窗内 widget。"""
-    # 1. 整页挑战
     if is_cf_challenge_page(page):
-        ok = wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=tag)
-        if not ok:
+        if not wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=tag):
             return False
 
-    # 2. 弹窗内 Turnstile widget
     has_div = False
     has_iframe = False
     try:
@@ -403,6 +431,8 @@ def handle_cloudflare(page, tag=""):
     log("⚠️ 页面检测到 Turnstile widget...")
     return solve_cf_and_wait_token(page, timeout=CF_CLICK_TIMEOUT, tag=tag)
 
+
+# ---------- 通用点击和弹窗操作 ----------
 
 def close_cookie_consent(page):
     try:
@@ -458,8 +488,6 @@ def click_accept_if_present(page):
             continue
     return False
 
-
-# ---------- 点击工具 ----------
 
 def mouse_click_element(page, locator, label=""):
     try:
@@ -556,7 +584,7 @@ def login(page, email, password, cookie_value):
         return False
 
 
-# ---------- 服务页操作 ----------
+# ---------- 导航与服务页 ----------
 
 def get_server_id(page):
     try:
@@ -576,19 +604,15 @@ def get_server_id(page):
 
 
 def goto_and_pass_cf(page, url, tag=""):
-    """导航到 url 并等待 CF 整页挑战通过。"""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
         log(f"⚠️ 导航失败: {e}")
         return False
 
-    # 主动等待整页挑战
     if not wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=tag):
         return False
-    # 再等 networkidle + 额外时间让 JS 渲染
     wait_page_ready(page, extra_wait=PAGE_EXTRA_WAIT, timeout_ms=PAGE_NETWORKIDLE_TIMEOUT)
-    # 再次检查是否又被挑战
     if not wait_cf_challenge_pass(page, timeout=30, tag=tag):
         return False
     handle_cloudflare(page, tag=tag)
@@ -643,7 +667,7 @@ def detect_renewal_window_msg(page):
     return None
 
 
-# ---------- 未付发票提取 ----------
+# ---------- 发票 ----------
 
 def get_unpaid_invoice_urls(page, tag="acc"):
     log(f"🔍 访问未付发票列表: {UNPAID_INVOICES_URL}")
@@ -799,7 +823,6 @@ def renew_service(page, service_url, tag="acc"):
     log("➡ 进入续期流程...")
     close_cookie_consent(page)
 
-    # 到达服务页（带 CF 处理）
     if service_url not in page.url or is_cf_challenge_page(page):
         if not goto_and_pass_cf(page, service_url, tag=f"renew_{tag}"):
             log("❌ 无法通过 CF 到达服务页")
@@ -883,7 +906,6 @@ def renew_service(page, service_url, tag="acc"):
     if click_accept_if_present(page):
         time.sleep(2)
 
-    # CF：先处理整页挑战（万一弹窗触发），再处理 widget
     log("🔒 处理 CF（整页挑战 + Turnstile widget）...")
     if is_cf_challenge_page(page):
         if not wait_cf_challenge_pass(page, timeout=CF_CHALLENGE_MAX_WAIT, tag=f"modal_{tag}"):
