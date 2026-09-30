@@ -22,6 +22,7 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billin
 
 WAIT_RENDER_BEFORE_TURNSTILE = 5
 WAIT_AFTER_CREATE_CLICK      = 30
+PAY_WAIT_SECONDS             = 90   # 等待支付请求
 CF_TURNSTILE_TIMEOUT         = 15
 CF_RETRY_WAIT                = 10
 
@@ -464,7 +465,17 @@ def renew_service(page, service_url):
 
             time.sleep(2)
             page_text = page.locator("body").inner_text()
-            if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+            page_text_lower = page_text.lower()
+            restricted_keywords = [
+                "renewal restricted",
+                "can only renew",
+                "not yet time",
+                "too early",
+                "within 7 days",
+                "within 3 days",
+                "renewal window",
+            ]
+            if any(k in page_text_lower for k in restricted_keywords):
                 log("⚠️ 未到续期时间，无法续期。")
                 page.screenshot(path="renew_not_allowed.png")
                 return "NOT_TIME"
@@ -554,8 +565,8 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 枚举按钮失败: {e}")
 
-    # === 监听关键请求 ===
-    state = {"paid": False, "renewed": False}
+    # === 监听关键请求（含 Location 头） ===
+    state = {"paid": False, "renewed": False, "pay_location": "", "renew_location": ""}
 
     def on_response(resp):
         try:
@@ -563,13 +574,23 @@ def renew_service(page, service_url):
             method = resp.request.method
             if "hidencloud" not in url and "challenges.cloudflare" not in url:
                 return
-            line = f"[{resp.status}] {method} {url}"
             if method in ("POST", "PUT", "PATCH"):
+                location = ""
+                try:
+                    location = resp.headers.get("location", "")
+                except Exception:
+                    pass
+                line = f"[{resp.status}] {method} {url}"
+                if location:
+                    line += f"  →  Location: {location}"
                 log(f"🌐 {line}")
+
                 if "/balance/add" in url and resp.status in (200, 302, 303):
                     state["paid"] = True
+                    state["pay_location"] = location
                 if "/renew" in url and resp.status in (200, 302, 303):
                     state["renewed"] = True
+                    state["renew_location"] = location
         except Exception:
             pass
 
@@ -595,6 +616,8 @@ def renew_service(page, service_url):
         log(f"⚠️ 保存现场失败: {e}")
 
     log(f"🔍 状态: renewed={state['renewed']}, paid={state['paid']}")
+    if state['renew_location']:
+        log(f"🔍 /renew 重定向到: {state['renew_location']}")
 
     # === 检查是否进入发票页 ===
     new_invoice_url = None
@@ -622,19 +645,31 @@ def renew_service(page, service_url):
                 log("✅ 发现 'Pay Now'，用 JS 强制点击")
                 js_click(pay_now, page, "Pay Now")
 
-                log("⏳ 等待支付请求 /balance/add（最多 30 秒）...")
-                for _ in range(30):
+                log(f"⏳ 等待支付请求 /balance/add（最多 {PAY_WAIT_SECONDS} 秒）...")
+                for i in range(PAY_WAIT_SECONDS):
                     if state["paid"]:
-                        log("✅ 检测到 /balance/add，支付完成！")
+                        log(f"✅ 第 {i} 秒检测到 /balance/add，支付完成！")
+                        if state['pay_location']:
+                            log(f"🔍 /balance/add 重定向到: {state['pay_location']}")
                         break
                     if any(k in page.url for k in INVOICE_URL_KEYWORDS):
                         new_invoice_url = page.url
                         log(f"🎉 页面跳转: {new_invoice_url}")
                         break
+                    for p in page.context.pages:
+                        if any(k in p.url for k in INVOICE_URL_KEYWORDS):
+                            new_invoice_url = p.url
+                            page = p
+                            log(f"🎉 新标签页跳转: {new_invoice_url}")
+                            break
+                    if new_invoice_url:
+                        break
+                    if i > 0 and i % 15 == 0:
+                        log(f"   ... 已等待 {i} 秒")
                     time.sleep(1)
 
                 if not state["paid"] and not new_invoice_url:
-                    log("⚠️ 30 秒内未检测到支付响应")
+                    log(f"⚠️ {PAY_WAIT_SECONDS} 秒内未检测到支付响应")
         except Exception as e:
             log(f"⚠️ 处理 Pay Now 失败: {e}")
 
@@ -654,6 +689,15 @@ def renew_service(page, service_url):
             time.sleep(5)
         except Exception as e:
             log(f"⚠️ 点击 'Pay' 失败: {e}")
+
+    # === 兜底：如果既没支付也没跳转，再等 30 秒 ===
+    if not state["paid"] and not new_invoice_url and state["renewed"]:
+        log("⏳ 续期已触发但未见支付，再等 30 秒...")
+        for i in range(30):
+            if state["paid"]:
+                log(f"✅ 第 {i} 秒检测到 /balance/add")
+                break
+            time.sleep(1)
 
     # === 最后：等页面稳定后重新加载服务页 ===
     if state["paid"] or state["renewed"] or new_invoice_url:
@@ -712,11 +756,16 @@ def process_account(identifier, email, password, cookie_value, browser):
             status = "❌ 续期失败"
         else:
             new_due = get_due_date(page, service_url)
+            log(f"📆 续费前到期时间：{old_due}")
             log(f"📆 续费后到期时间：{new_due}")
             if new_due != "未知" and new_due == old_due:
                 status = "⚠️ 续期后到期时间未变化"
+                log("⚠️ 到期时间未变化，说明续期未真正生效")
+                log("⚠️ 请检查：余额是否充足？是否在续期窗口内？服务器状态是否正常？")
             else:
                 status = "✅ 续期成功"
+                log("✅ 到期时间已更新，续期成功")
+        log(f"🏁 最终状态: {status}")
         return (status, old_due, new_due)
 
     except Exception as e:
