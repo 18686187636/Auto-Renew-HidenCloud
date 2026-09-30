@@ -22,10 +22,8 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billin
 
 WAIT_RENDER_BEFORE_TURNSTILE = 5
 WAIT_AFTER_CREATE_CLICK      = 30
-FALLBACK_POLL_SECONDS        = 60
-CF_TURNSTILE_TIMEOUT         = 15   # 缩短：找不到 checkbox 就快速放弃
+CF_TURNSTILE_TIMEOUT         = 15
 CF_RETRY_WAIT                = 10
-FALLBACK_WAIT_SECONDS        = 20
 
 
 def log(message):
@@ -90,7 +88,6 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 def handle_cloudflare(page):
-    """处理主页面上的 CF 交互式验证（如果有 checkbox）"""
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
     if page.locator(iframe_selector).count() == 0:
         return True
@@ -118,20 +115,14 @@ def handle_cloudflare(page):
 
 
 def solve_turnstile_checkbox(page, timeout=15):
-    """
-    智能处理 Cloudflare Turnstile：
-    - 如果找到 checkbox，点击它
-    - 如果找不到 checkbox（自动挑战模式），快速返回 True，不浪费等待
-    - 通过递归 JS 遍历所有嵌套 iframe
-    """
+    """智能处理 CF Turnstile：找到 checkbox 就点，找不到快速跳过"""
     start = time.time()
     no_checkbox_rounds = 0
-    MAX_NO_CHECKBOX_ROUNDS = 3   # 连续 3 轮找不到 checkbox 就认为无 checkbox 模式
+    MAX_NO_CHECKBOX_ROUNDS = 3
 
     js_click_turnstile = """
     () => {
         const results = { found: false, clicked: false, path: [] };
-
         function tryClickInDoc(doc, depth, path) {
             if (depth > 5) return false;
             const sels = [
@@ -177,14 +168,12 @@ def solve_turnstile_checkbox(page, timeout=15):
             }
             return false;
         }
-
         tryClickInDoc(document, 0, []);
         return results;
     }
     """
 
     while time.time() - start < timeout:
-        # 检查 CF frame 是否还在
         cf_exists = any(
             "cloudflare" in (f.url or "").lower() or "turnstile" in (f.url or "").lower()
             for f in page.frames
@@ -193,7 +182,6 @@ def solve_turnstile_checkbox(page, timeout=15):
             log("✅ 无 CF frame，视为通过")
             return True
 
-        # 方式 1：JS 递归查找并点击
         try:
             result = page.evaluate(js_click_turnstile)
             if result and result.get("clicked"):
@@ -209,7 +197,6 @@ def solve_turnstile_checkbox(page, timeout=15):
                 log("⚠️ 点击后 CF frame 仍在")
                 no_checkbox_rounds = 0
             else:
-                # 没找到 checkbox
                 no_checkbox_rounds += 1
                 if no_checkbox_rounds == 1:
                     log(f"🔍 第 {no_checkbox_rounds} 轮未找到 checkbox...")
@@ -222,7 +209,6 @@ def solve_turnstile_checkbox(page, timeout=15):
             if no_checkbox_rounds >= MAX_NO_CHECKBOX_ROUNDS:
                 return True
 
-        # 方式 2：frame_locator 兜底
         for f in page.frames:
             u = (f.url or "").lower()
             if "cloudflare" not in u and "turnstile" not in u:
@@ -251,8 +237,8 @@ def solve_turnstile_checkbox(page, timeout=15):
 
         time.sleep(2)
 
-    log("⚠️ Turnstile 处理超时，但继续后续流程")
-    return True  # 不要因为 CF 处理失败而中断流程
+    log("⚠️ Turnstile 处理超时，继续后续流程")
+    return True
 
 
 def close_cookie_consent(page):
@@ -401,13 +387,12 @@ def get_due_date(page, service_url):
 
 
 def js_click(locator, page, label=""):
-    """用 JS 强制点击，绕过 viewport 限制。返回是否成功。"""
+    """JS 强制点击，绕过 viewport 限制"""
     try:
         locator.evaluate("el => { el.scrollIntoView({block:'center'}); el.click(); }")
         return True
     except Exception as e:
         log(f"⚠️ JS 点击 {label} 失败: {e}")
-        # 再尝试：先 scroll 再 force click
         try:
             locator.scroll_into_view_if_needed(timeout=5000)
             locator.click(timeout=5000, force=True)
@@ -415,6 +400,42 @@ def js_click(locator, page, label=""):
         except Exception as e2:
             log(f"⚠️ force 点击 {label} 也失败: {e2}")
             return False
+
+
+def click_submit_button(page, locator, label=""):
+    """点击 type=submit 按钮：优先 form.requestSubmit"""
+    try:
+        ok = locator.evaluate("""
+            el => {
+                const form = el.form || el.closest('form');
+                if (form && form.requestSubmit) {
+                    form.requestSubmit(el);
+                    return true;
+                }
+                return false;
+            }
+        """)
+        if ok:
+            log(f"✅ 通过 form.requestSubmit 提交 {label}")
+            return True
+    except Exception as e:
+        log(f"⚠️ requestSubmit 失败: {e}")
+
+    try:
+        locator.scroll_into_view_if_needed(timeout=5000)
+        locator.click(timeout=5000)
+        log(f"✅ Playwright click {label}")
+        return True
+    except Exception as e:
+        log(f"⚠️ Playwright click 失败: {e}")
+
+    try:
+        locator.evaluate("el => el.click()")
+        log(f"✅ JS click {label}")
+        return True
+    except Exception as e:
+        log(f"❌ JS click 也失败: {e}")
+        return False
 
 
 def renew_service(page, service_url):
@@ -428,7 +449,9 @@ def renew_service(page, service_url):
 
     log("🖱️ 准备点击 'Renew' 按钮...")
     renew_btn = page.locator('button:has-text("Renew")').first
-    create_btn = page.locator('button:has-text("Create Invoice")').first
+    create_btn = page.locator('button[type="submit"]:has-text("Create Invoice")').first
+    if create_btn.count() == 0:
+        create_btn = page.locator('button:has-text("Create Invoice")').first
 
     modal_opened = False
     for i in range(3):
@@ -469,10 +492,9 @@ def renew_service(page, service_url):
     log(f"⏳ 弹窗已弹出，等待 {WAIT_RENDER_BEFORE_TURNSTILE} 秒让页面渲染...")
     time.sleep(WAIT_RENDER_BEFORE_TURNSTILE)
 
-    log("🔒 智能检测 Cloudflare Turnstile（有 checkbox 则点击，无则快速跳过）...")
+    log("🔒 智能检测 Cloudflare Turnstile...")
     solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
 
-    # 再次检查是否还有 CF
     cf_exists = any(
         "cloudflare" in (f.url or "").lower() or "turnstile" in (f.url or "").lower()
         for f in page.frames
@@ -532,41 +554,32 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 枚举按钮失败: {e}")
 
-    network_log = []
+    # === 监听关键请求 ===
+    state = {"paid": False, "renewed": False}
+
     def on_response(resp):
         try:
-            if resp.request.method in ("POST", "PUT", "PATCH"):
-                line = f"[{resp.status}] {resp.request.method} {resp.url}"
-                network_log.append(line)
-                # 只记录关键请求
-                if "hidencloud" in resp.url or "challenges.cloudflare" in resp.url:
-                    log(f"🌐 {line}")
+            url = resp.url or ""
+            method = resp.request.method
+            if "hidencloud" not in url and "challenges.cloudflare" not in url:
+                return
+            line = f"[{resp.status}] {method} {url}"
+            if method in ("POST", "PUT", "PATCH"):
+                log(f"🌐 {line}")
+                if "/balance/add" in url and resp.status in (200, 302, 303):
+                    state["paid"] = True
+                if "/renew" in url and resp.status in (200, 302, 303):
+                    state["renewed"] = True
         except Exception:
             pass
+
     page.on("response", on_response)
 
     pages_before = len(page.context.pages)
     log(f"🔍 点击前 URL: {page.url}")
 
-    log("🖱️ 点击 'Create Invoice'...")
-    try:
-        create_btn.scroll_into_view_if_needed()
-    except Exception:
-        pass
-
-    clicked = False
-    try:
-        create_btn.click(timeout=5000)
-        clicked = True
-    except Exception as e:
-        log(f"⚠️ 普通点击失败，尝试 JS 点击: {e}")
-        try:
-            create_btn.evaluate("el => el.click()")
-            clicked = True
-        except Exception as e2:
-            log(f"❌ JS 点击也失败: {e2}")
-
-    if not clicked:
+    log("🖱️ 点击 'Create Invoice'（type=submit）...")
+    if not click_submit_button(page, create_btn, "Create Invoice"):
         page.screenshot(path="create_invoice_click_failed.png")
         return False
 
@@ -581,28 +594,25 @@ def renew_service(page, service_url):
     except Exception as e:
         log(f"⚠️ 保存现场失败: {e}")
 
-    pages_after = len(page.context.pages)
-    log(f"🔍 等待后页面数: {pages_before} -> {pages_after}")
-    new_invoice_url = None
+    log(f"🔍 状态: renewed={state['renewed']}, paid={state['paid']}")
 
+    # === 检查是否进入发票页 ===
+    new_invoice_url = None
+    pages_after = len(page.context.pages)
     if pages_after > pages_before:
         for p in page.context.pages:
             if any(k in p.url for k in INVOICE_URL_KEYWORDS):
-                try:
-                    p.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass
                 new_invoice_url = p.url
                 page = p
-                log(f"✅ 在新标签页发现发票: {new_invoice_url}")
+                log(f"✅ 新标签页发票: {new_invoice_url}")
                 break
 
     if not new_invoice_url and any(k in page.url for k in INVOICE_URL_KEYWORDS):
         new_invoice_url = page.url
-        log(f"🎉 当前页已跳转: {new_invoice_url}")
+        log(f"🎉 当前页跳转: {new_invoice_url}")
 
-    # === 关键：检查弹窗内是否出现 Pay Now，用 JS 点击绕过 viewport ===
-    if not new_invoice_url:
+    # === 核心：点击 Pay Now + 监听 /balance/add ===
+    if not new_invoice_url and not state["paid"]:
         log("🔍 检查弹窗内是否出现 'Pay Now'...")
         try:
             pay_now = page.locator('button:has-text("Pay Now"), a:has-text("Pay Now")').first
@@ -610,105 +620,59 @@ def renew_service(page, service_url):
             log(f"🔍 Pay Now 按钮数量: {cnt}")
             if cnt > 0:
                 log("✅ 发现 'Pay Now'，用 JS 强制点击")
-                if js_click(pay_now, page, "Pay Now"):
-                    time.sleep(5)
+                js_click(pay_now, page, "Pay Now")
+
+                log("⏳ 等待支付请求 /balance/add（最多 30 秒）...")
+                for _ in range(30):
+                    if state["paid"]:
+                        log("✅ 检测到 /balance/add，支付完成！")
+                        break
                     if any(k in page.url for k in INVOICE_URL_KEYWORDS):
                         new_invoice_url = page.url
-                        log(f"🎉 点击 Pay Now 后已跳转: {new_invoice_url}")
-                    else:
-                        log(f"⚠️ 点击后 URL 仍是: {page.url}")
-                        # 再轮询 10 秒看是否跳转
-                        for _ in range(10):
-                            if any(k in page.url for k in INVOICE_URL_KEYWORDS):
-                                new_invoice_url = page.url
-                                log(f"🎉 延迟跳转: {new_invoice_url}")
-                                break
-                            for p in page.context.pages:
-                                if any(k in p.url for k in INVOICE_URL_KEYWORDS):
-                                    new_invoice_url = p.url
-                                    page = p
-                                    break
-                            if new_invoice_url:
-                                break
-                            time.sleep(1)
+                        log(f"🎉 页面跳转: {new_invoice_url}")
+                        break
+                    time.sleep(1)
+
+                if not state["paid"] and not new_invoice_url:
+                    log("⚠️ 30 秒内未检测到支付响应")
         except Exception as e:
             log(f"⚠️ 处理 Pay Now 失败: {e}")
 
-    if not new_invoice_url:
-        log(f"⏳ 未跳转，继续兜底轮询 {FALLBACK_POLL_SECONDS} 秒...")
-        start_wait = time.time()
-        while time.time() - start_wait < FALLBACK_POLL_SECONDS:
-            if any(k in page.url for k in INVOICE_URL_KEYWORDS):
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
-                break
-            for p in page.context.pages:
-                if any(k in p.url for k in INVOICE_URL_KEYWORDS):
-                    new_invoice_url = p.url
-                    page = p
-                    log(f"🎉 在其它标签页发现发票: {new_invoice_url}")
-                    break
-            if new_invoice_url:
-                break
-            # 轮询期间只在确实有 checkbox 时尝试点击（不浪费）
-            try:
-                if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                    # 尝试找 checkbox，找不到就跳过
-                    found_cb = False
-                    for f in page.frames:
-                        u = (f.url or "").lower()
-                        if "cloudflare" not in u and "turnstile" not in u:
-                            continue
-                        try:
-                            if f.locator('input[type="checkbox"]').count() > 0:
-                                found_cb = True
-                                break
-                        except Exception:
-                            pass
-                    if found_cb:
-                        log("⚠️ 发现 CF checkbox，尝试点击...")
-                        solve_turnstile_checkbox(page, timeout=5)
-            except Exception:
-                pass
-            time.sleep(1)
+    # === 如果进入了发票页，点 Pay ===
+    if new_invoice_url:
+        if page.url != new_invoice_url:
+            page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        close_cookie_consent(page)
 
-    if not new_invoice_url:
-        log("❌ 未能进入发票页面，超时。")
-        log(f"🌐 本次关键网络请求: {[l for l in network_log if 'hidencloud' in l or 'challenges.cloudflare' in l]}")
+        log("🔎 查找 'Pay' 按钮...")
         try:
-            page.screenshot(path="renew_stuck_invoice.png", full_page=True)
-            with open("renew_stuck_invoice.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-        except Exception:
-            pass
-        return False
+            pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+            pay_btn.wait_for(state="visible", timeout=30000)
+            js_click(pay_btn, page, "Pay")
+            log("✅ 'Pay' 按钮已点击")
+            time.sleep(5)
+        except Exception as e:
+            log(f"⚠️ 点击 'Pay' 失败: {e}")
 
-    if page.url != new_invoice_url:
-        page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
-    handle_cloudflare(page)
-    close_cookie_consent(page)
+    # === 最后：等页面稳定后重新加载服务页 ===
+    if state["paid"] or state["renewed"] or new_invoice_url:
+        log("⏳ 支付/续期已触发，等待 5 秒让后端处理...")
+        time.sleep(5)
 
-    log("🔎 查找 'Pay' 按钮...")
+    log("🔍 返回服务页确认状态...")
     try:
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        # 用 JS 点击绕过 viewport
-        if js_click(pay_btn, page, "Pay"):
-            log("✅ 'Pay' 按钮已点击。")
-        else:
-            log("❌ 'Pay' 按钮点击失败")
-            page.screenshot(path="pay_btn_failed.png")
-            return False
+        page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        close_cookie_consent(page)
     except Exception as e:
-        log(f"❌ 点击 'Pay' 失败: {e}")
-        page.screenshot(path="pay_btn_failed.png")
-        return False
+        log(f"⚠️ 返回服务页失败: {e}")
 
-    time.sleep(5)
-    page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-    handle_cloudflare(page)
-    close_cookie_consent(page)
-    return True
+    if state["paid"] or state["renewed"] or new_invoice_url:
+        return True
+
+    log("❌ 未能完成续期流程")
+    return False
 
 
 def process_account(identifier, email, password, cookie_value, browser):
