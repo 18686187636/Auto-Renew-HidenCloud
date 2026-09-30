@@ -23,8 +23,8 @@ INVOICE_URL_KEYWORDS = ("/payment/invoice/", "/invoice/", "/invoices/", "/billin
 WAIT_RENDER_BEFORE_TURNSTILE = 5
 WAIT_AFTER_CREATE_CLICK      = 30
 FALLBACK_POLL_SECONDS        = 60
-CF_TURNSTILE_TIMEOUT         = 30
-CF_RETRY_WAIT                = 15
+CF_TURNSTILE_TIMEOUT         = 15   # 缩短：找不到 checkbox 就快速放弃
+CF_RETRY_WAIT                = 10
 FALLBACK_WAIT_SECONDS        = 20
 
 
@@ -90,6 +90,7 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 def handle_cloudflare(page):
+    """处理主页面上的 CF 交互式验证（如果有 checkbox）"""
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
     if page.locator(iframe_selector).count() == 0:
         return True
@@ -116,13 +117,16 @@ def handle_cloudflare(page):
     return False
 
 
-def solve_turnstile_checkbox(page, timeout=30):
+def solve_turnstile_checkbox(page, timeout=15):
     """
-    处理嵌套在弹窗 iframe 内的 Cloudflare Turnstile。
-    多级递归查找，用 JS 派发鼠标事件更可靠。
+    智能处理 Cloudflare Turnstile：
+    - 如果找到 checkbox，点击它
+    - 如果找不到 checkbox（自动挑战模式），快速返回 True，不浪费等待
+    - 通过递归 JS 遍历所有嵌套 iframe
     """
     start = time.time()
-    checkbox_found = False
+    no_checkbox_rounds = 0
+    MAX_NO_CHECKBOX_ROUNDS = 3   # 连续 3 轮找不到 checkbox 就认为无 checkbox 模式
 
     js_click_turnstile = """
     () => {
@@ -180,20 +184,20 @@ def solve_turnstile_checkbox(page, timeout=30):
     """
 
     while time.time() - start < timeout:
-        cf_frames = []
-        for f in page.frames:
-            u = (f.url or "").lower()
-            if "cloudflare" in u or "turnstile" in u:
-                cf_frames.append(f)
-        log(f"🔍 frame 总数: {len(page.frames)}, 含 cloudflare/turnstile: {len(cf_frames)}")
+        # 检查 CF frame 是否还在
+        cf_exists = any(
+            "cloudflare" in (f.url or "").lower() or "turnstile" in (f.url or "").lower()
+            for f in page.frames
+        )
+        if not cf_exists:
+            log("✅ 无 CF frame，视为通过")
+            return True
 
-        # 方式 1：JS 递归遍历
+        # 方式 1：JS 递归查找并点击
         try:
             result = page.evaluate(js_click_turnstile)
             if result and result.get("clicked"):
-                checkbox_found = True
                 log(f"🖱️ JS 递归点击成功，路径: {result.get('path')}")
-                log("⏳ 等待 6 秒看验证结果...")
                 time.sleep(6)
                 still_cf = any(
                     "cloudflare" in (f.url or "").lower() or "turnstile" in (f.url or "").lower()
@@ -202,22 +206,33 @@ def solve_turnstile_checkbox(page, timeout=30):
                 if not still_cf:
                     log("✅ Turnstile 验证通过！")
                     return True
-                log("⚠️ 点击后 CF frame 仍在，继续尝试...")
-            elif result and result.get("found"):
-                checkbox_found = True
-                log(f"🔍 JS 找到了 checkbox 但点击可能无效，路径: {result.get('path')}")
+                log("⚠️ 点击后 CF frame 仍在")
+                no_checkbox_rounds = 0
+            else:
+                # 没找到 checkbox
+                no_checkbox_rounds += 1
+                if no_checkbox_rounds == 1:
+                    log(f"🔍 第 {no_checkbox_rounds} 轮未找到 checkbox...")
+                if no_checkbox_rounds >= MAX_NO_CHECKBOX_ROUNDS:
+                    log(f"✅ 连续 {MAX_NO_CHECKBOX_ROUNDS} 轮未找到 checkbox，判定为自动挑战模式，跳过")
+                    return True
         except Exception as e:
-            log(f"⚠️ JS 递归点击失败: {e}")
+            log(f"⚠️ JS 递归失败: {e}")
+            no_checkbox_rounds += 1
+            if no_checkbox_rounds >= MAX_NO_CHECKBOX_ROUNDS:
+                return True
 
-        # 方式 2：frame_locator
-        for f in cf_frames:
+        # 方式 2：frame_locator 兜底
+        for f in page.frames:
+            u = (f.url or "").lower()
+            if "cloudflare" not in u and "turnstile" not in u:
+                continue
             try:
-                for sel in ['input[type="checkbox"]', '[role="checkbox"]', 'label']:
+                for sel in ['input[type="checkbox"]', '[role="checkbox"]']:
                     cb = f.locator(sel)
                     if cb.count() > 0:
                         try:
-                            if cb.first.is_visible(timeout=1000):
-                                checkbox_found = True
+                            if cb.first.is_visible(timeout=800):
                                 log(f"🖱️ frame_locator 点击 {sel}")
                                 cb.first.click(force=True, timeout=3000)
                                 time.sleep(6)
@@ -228,49 +243,16 @@ def solve_turnstile_checkbox(page, timeout=30):
                                 if not still_cf:
                                     log("✅ Turnstile 验证通过！")
                                     return True
-                        except Exception as e:
-                            log(f"⚠️ 点击 {sel} 失败: {e}")
-            except Exception as e:
-                log(f"⚠️ 处理 frame 失败: {e}")
-
-        # 方式 3：物理坐标点击
-        try:
-            iframe_els = page.locator('iframe')
-            n = iframe_els.count()
-            for i in range(n):
-                try:
-                    src = iframe_els.nth(i).get_attribute("src") or ""
-                    if "cloudflare" in src.lower() or "turnstile" in src.lower():
-                        box = iframe_els.nth(i).bounding_box()
-                        if box:
-                            x = box["x"] + 30
-                            y = box["y"] + box["height"] / 2
-                            log(f"🖱️ 物理点击 iframe[{i}] 坐标 ({x:.0f}, {y:.0f})")
-                            page.mouse.move(x - 10, y - 10)
-                            time.sleep(0.3)
-                            page.mouse.move(x, y)
-                            time.sleep(0.2)
-                            page.mouse.click(x, y)
-                            time.sleep(6)
-                            still_cf = any(
-                                "cloudflare" in (fr.url or "").lower() or "turnstile" in (fr.url or "").lower()
-                                for fr in page.frames
-                            )
-                            if not still_cf:
-                                log("✅ Turnstile 验证通过！")
-                                return True
-                except Exception as e:
-                    log(f"⚠️ 物理点击 iframe[{i}] 失败: {e}")
-        except Exception as e:
-            log(f"⚠️ 枚举 iframe 失败: {e}")
+                                no_checkbox_rounds = 0
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         time.sleep(2)
 
-    if checkbox_found:
-        log("❌ 已找到 checkbox 但验证未通过")
-    else:
-        log("⚠️ 所有 frame 中均未找到 checkbox")
-    return False
+    log("⚠️ Turnstile 处理超时，但继续后续流程")
+    return True  # 不要因为 CF 处理失败而中断流程
 
 
 def close_cookie_consent(page):
@@ -418,6 +400,23 @@ def get_due_date(page, service_url):
     return "未知"
 
 
+def js_click(locator, page, label=""):
+    """用 JS 强制点击，绕过 viewport 限制。返回是否成功。"""
+    try:
+        locator.evaluate("el => { el.scrollIntoView({block:'center'}); el.click(); }")
+        return True
+    except Exception as e:
+        log(f"⚠️ JS 点击 {label} 失败: {e}")
+        # 再尝试：先 scroll 再 force click
+        try:
+            locator.scroll_into_view_if_needed(timeout=5000)
+            locator.click(timeout=5000, force=True)
+            return True
+        except Exception as e2:
+            log(f"⚠️ force 点击 {label} 也失败: {e2}")
+            return False
+
+
 def renew_service(page, service_url):
     log("➡ 进入续期流程...")
     close_cookie_consent(page)
@@ -470,17 +469,18 @@ def renew_service(page, service_url):
     log(f"⏳ 弹窗已弹出，等待 {WAIT_RENDER_BEFORE_TURNSTILE} 秒让页面渲染...")
     time.sleep(WAIT_RENDER_BEFORE_TURNSTILE)
 
-    log("🔒 尝试处理 Cloudflare Turnstile 验证（递归遍历嵌套 frame）...")
-    turnstile_ok = solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
+    log("🔒 智能检测 Cloudflare Turnstile（有 checkbox 则点击，无则快速跳过）...")
+    solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
 
-    if not turnstile_ok:
-        log(f"⚠️ Turnstile 第一次未通过，等待 {CF_RETRY_WAIT} 秒后重试...")
+    # 再次检查是否还有 CF
+    cf_exists = any(
+        "cloudflare" in (f.url or "").lower() or "turnstile" in (f.url or "").lower()
+        for f in page.frames
+    )
+    if cf_exists:
+        log(f"⚠️ CF 仍在，再给 {CF_RETRY_WAIT} 秒...")
         time.sleep(CF_RETRY_WAIT)
-        turnstile_ok = solve_turnstile_checkbox(page, timeout=CF_TURNSTILE_TIMEOUT)
-
-    if not turnstile_ok:
-        log(f"⚠️ 无法主动通过 CF 验证，回退到等待 {FALLBACK_WAIT_SECONDS} 秒...")
-        time.sleep(FALLBACK_WAIT_SECONDS)
+        solve_turnstile_checkbox(page, timeout=10)
 
     try:
         disabled = create_btn.is_disabled()
@@ -538,7 +538,9 @@ def renew_service(page, service_url):
             if resp.request.method in ("POST", "PUT", "PATCH"):
                 line = f"[{resp.status}] {resp.request.method} {resp.url}"
                 network_log.append(line)
-                log(f"🌐 {line}")
+                # 只记录关键请求
+                if "hidencloud" in resp.url or "challenges.cloudflare" in resp.url:
+                    log(f"🌐 {line}")
         except Exception:
             pass
     page.on("response", on_response)
@@ -599,19 +601,38 @@ def renew_service(page, service_url):
         new_invoice_url = page.url
         log(f"🎉 当前页已跳转: {new_invoice_url}")
 
+    # === 关键：检查弹窗内是否出现 Pay Now，用 JS 点击绕过 viewport ===
     if not new_invoice_url:
-        log("🔍 检查弹窗内是否直接出现 'Pay Now'...")
+        log("🔍 检查弹窗内是否出现 'Pay Now'...")
         try:
             pay_now = page.locator('button:has-text("Pay Now"), a:has-text("Pay Now")').first
-            if pay_now.is_visible(timeout=3000):
-                log("✅ 发现 'Pay Now'，直接点击")
-                pay_now.click()
-                time.sleep(5)
-                if any(k in page.url for k in INVOICE_URL_KEYWORDS):
-                    new_invoice_url = page.url
-                    log(f"🎉 点击 Pay Now 后已跳转: {new_invoice_url}")
+            cnt = pay_now.count()
+            log(f"🔍 Pay Now 按钮数量: {cnt}")
+            if cnt > 0:
+                log("✅ 发现 'Pay Now'，用 JS 强制点击")
+                if js_click(pay_now, page, "Pay Now"):
+                    time.sleep(5)
+                    if any(k in page.url for k in INVOICE_URL_KEYWORDS):
+                        new_invoice_url = page.url
+                        log(f"🎉 点击 Pay Now 后已跳转: {new_invoice_url}")
+                    else:
+                        log(f"⚠️ 点击后 URL 仍是: {page.url}")
+                        # 再轮询 10 秒看是否跳转
+                        for _ in range(10):
+                            if any(k in page.url for k in INVOICE_URL_KEYWORDS):
+                                new_invoice_url = page.url
+                                log(f"🎉 延迟跳转: {new_invoice_url}")
+                                break
+                            for p in page.context.pages:
+                                if any(k in p.url for k in INVOICE_URL_KEYWORDS):
+                                    new_invoice_url = p.url
+                                    page = p
+                                    break
+                            if new_invoice_url:
+                                break
+                            time.sleep(1)
         except Exception as e:
-            log(f"⚠️ 未找到 Pay Now: {e}")
+            log(f"⚠️ 处理 Pay Now 失败: {e}")
 
     if not new_invoice_url:
         log(f"⏳ 未跳转，继续兜底轮询 {FALLBACK_POLL_SECONDS} 秒...")
@@ -629,15 +650,31 @@ def renew_service(page, service_url):
                     break
             if new_invoice_url:
                 break
-            if any("cloudflare" in (f.url or "").lower() or "turnstile" in (f.url or "").lower()
-                   for f in page.frames):
-                log("⚠️ 检测到 CF，尝试处理...")
-                solve_turnstile_checkbox(page, timeout=5)
+            # 轮询期间只在确实有 checkbox 时尝试点击（不浪费）
+            try:
+                if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                    # 尝试找 checkbox，找不到就跳过
+                    found_cb = False
+                    for f in page.frames:
+                        u = (f.url or "").lower()
+                        if "cloudflare" not in u and "turnstile" not in u:
+                            continue
+                        try:
+                            if f.locator('input[type="checkbox"]').count() > 0:
+                                found_cb = True
+                                break
+                        except Exception:
+                            pass
+                    if found_cb:
+                        log("⚠️ 发现 CF checkbox，尝试点击...")
+                        solve_turnstile_checkbox(page, timeout=5)
+            except Exception:
+                pass
             time.sleep(1)
 
     if not new_invoice_url:
         log("❌ 未能进入发票页面，超时。")
-        log(f"🌐 本次网络请求记录: {network_log}")
+        log(f"🌐 本次关键网络请求: {[l for l in network_log if 'hidencloud' in l or 'challenges.cloudflare' in l]}")
         try:
             page.screenshot(path="renew_stuck_invoice.png", full_page=True)
             with open("renew_stuck_invoice.html", "w", encoding="utf-8") as f:
@@ -655,8 +692,13 @@ def renew_service(page, service_url):
     try:
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
-        log("✅ 'Pay' 按钮已点击。")
+        # 用 JS 点击绕过 viewport
+        if js_click(pay_btn, page, "Pay"):
+            log("✅ 'Pay' 按钮已点击。")
+        else:
+            log("❌ 'Pay' 按钮点击失败")
+            page.screenshot(path="pay_btn_failed.png")
+            return False
     except Exception as e:
         log(f"❌ 点击 'Pay' 失败: {e}")
         page.screenshot(path="pay_btn_failed.png")
