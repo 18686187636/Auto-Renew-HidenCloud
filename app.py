@@ -63,6 +63,30 @@ try {
 """
 
 
+def apply_stealth(page):
+    """
+    注入 stealth script。
+    patchright 里 page.add_init_script() 对多 context 场景会报
+    'Page' object has no attribute '_options'，此时回退到 CDP 注入。
+    """
+    try:
+        page.add_init_script(STEALTH_JS)
+        return True
+    except AttributeError as e:
+        log(f"⚠️ page.add_init_script 触发 patchright bug: {e}，改用 CDP 注入")
+    except Exception as e:
+        log(f"⚠️ page.add_init_script 失败: {e}，改用 CDP 注入")
+
+    try:
+        client = page.context.new_cdp_session(page)
+        client.send('Page.addScriptToEvaluateOnNewDocument', {'source': STEALTH_JS})
+        log("✅ 已通过 CDP 注入 stealth script")
+        return True
+    except Exception as e:
+        log(f"⚠️ CDP 注入 stealth 失败: {e}")
+        return False
+
+
 def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
@@ -106,7 +130,7 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 # =========================================================
-# Cloudflare Turnstile 处理（与单账号脚本完全一致）
+# Cloudflare Turnstile 处理（与单账号脚本一致）
 # =========================================================
 TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]'
 TURNSTILE_FRAME_URL_MARKER = 'challenges.cloudflare.com'
@@ -391,7 +415,7 @@ def solve_turnstile(page, timeout=120, success_check=None,
 
 
 # =========================================================
-# 登录（多账号版：email / password / cookie 通过参数传入）
+# 登录
 # =========================================================
 def login(page, email, password, cookie_value):
     # 1. Cookie 登录尝试
@@ -410,8 +434,7 @@ def login(page, email, password, cookie_value):
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
             solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8)
-            page_title = page.title()
-            log(f"📝 当前Title: {page_title}")
+            log(f"📝 当前Title: {page.title()}")
             if "auth/login" not in page.url:
                 log("✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
@@ -494,8 +517,7 @@ def login(page, email, password, cookie_value):
 
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        page_title = page.title()
-        log(f"📝 当前Title: {page_title}")
+        log(f"📝 当前Title: {page.title()}")
         if "auth/login" in page.url:
             log("❌ 登录失败。")
             try:
@@ -552,6 +574,7 @@ def get_due_date(page, service_url):
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        time.sleep(3)  # 给页面渲染时间
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -578,6 +601,7 @@ def renew_service(page, service_url):
         if page.url != service_url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        time.sleep(3)  # 给页面渲染 Renew 按钮时间
 
         log("🖱️ 准备点击 'Renew' 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
@@ -586,7 +610,7 @@ def renew_service(page, service_url):
         modal_opened = False
         for i in range(6):
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.wait_for(state="visible", timeout=15000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
@@ -698,17 +722,32 @@ def renew_service(page, service_url):
 
 
 # =========================================================
-# 单账号处理（完全沿用单账号脚本里的浏览器创建方式）
+# 单账号处理
 # =========================================================
 def process_account(identifier, email, password, cookie_value, browser):
     log(f"===== 开始处理账号: {mask_email(email) or identifier} =====")
 
-    context = browser.new_context(
-        no_viewport=True,
-        proxy={"server": PROXY_SERVER} if IS_PROXY else None
-    )
-    page = context.new_page()
-    page.add_init_script(STEALTH_JS)
+    try:
+        context = browser.new_context(
+            no_viewport=True,
+            proxy={"server": PROXY_SERVER} if IS_PROXY else None
+        )
+    except Exception as e:
+        log(f"❌ new_context 失败: {e}")
+        return ("❌ 创建浏览器上下文失败", "未知", "未知")
+
+    try:
+        page = context.new_page()
+    except Exception as e:
+        log(f"❌ new_page 失败: {e}")
+        try:
+            context.close()
+        except Exception:
+            pass
+        return ("❌ 创建页面失败", "未知", "未知")
+
+    # 注入 stealth（patchright 对多次 add_init_script 有 bug，失败时回退 CDP）
+    apply_stealth(page)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
