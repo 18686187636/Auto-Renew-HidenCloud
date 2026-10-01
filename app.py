@@ -203,7 +203,6 @@ def challenge_frames(page):
     targets = []
     seen = []
 
-    # frame 树里反查（唯一能覆盖 shadow DOM 内嵌 iframe 的方式）
     try:
         for f in page.frames:
             if TURNSTILE_FRAME_URL_MARKER not in (f.url or ''):
@@ -220,7 +219,6 @@ def challenge_frames(page):
     except Exception:
         pass
 
-    # light DOM 里的挑战 iframe（老版结构）
     try:
         for el in page.locator(TURNSTILE_IFRAME_SEL).all():
             try:
@@ -300,7 +298,6 @@ def solve_turnstile(page, timeout=120, success_check=None,
     reload_done = 0
 
     while time.time() - start < timeout:
-        # 信号 1：调用方自定义判定
         if success_check is not None:
             try:
                 if success_check(page):
@@ -309,7 +306,6 @@ def solve_turnstile(page, timeout=120, success_check=None,
             except Exception:
                 pass
 
-        # 信号 2：token 已生成
         st = turnstile_state(page)
         if st["total"] > 0 and st["solved"] >= st["total"] and (
                 st["total"] > baseline["total"] or st["solved"] > baseline["solved"]):
@@ -348,7 +344,6 @@ def solve_turnstile(page, timeout=120, success_check=None,
             time.sleep(1)
             continue
 
-        # 逐个点击挑战框
         for el, box in targets:
             clicked = False
             try:
@@ -375,7 +370,6 @@ def solve_turnstile(page, timeout=120, success_check=None,
             click_count += 1
             time.sleep(random.uniform(4.0, 6.0))
 
-        # 多次点击仍未通过：刷新页面拿新挑战
         if reload_after and click_count >= reload_after and reload_done < 2:
             reload_done += 1
             log(f"🔄 累计点击 {click_count} 次未通过，刷新页面重试（第 {reload_done}/2 次）...")
@@ -404,12 +398,12 @@ def solve_turnstile(page, timeout=120, success_check=None,
 # =========================================================
 # 登录
 # =========================================================
-def login(page, email, password, cookie_value):
+def login(page, context, email, password, cookie_value):
     # 1. Cookie 登录
     if cookie_value:
         log("📇 尝试 Cookie 登录...")
         try:
-            page.context.add_cookies([{
+            context.add_cookies([{
                 'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
                 'value': cookie_value,
                 'domain': 'dash.hidencloud.com',
@@ -429,7 +423,7 @@ def login(page, email, password, cookie_value):
         except Exception as e:
             log(f"⚠️ Cookie 登录异常: {e}")
         try:
-            page.context.clear_cookies()
+            context.clear_cookies()
         except Exception:
             pass
 
@@ -711,16 +705,19 @@ def renew_service(page, service_url):
 # =========================================================
 def process_account(identifier, email, password, cookie_value, browser):
     log(f"===== 开始处理账号: {mask_email(email) or identifier} =====")
+
+    # patchright 兼容：显式 viewport，避免 no_viewport=True 触发 Page._options 属性错误
     context = browser.new_context(
-        no_viewport=True,
+        viewport={'width': 1920, 'height': 1080},
         proxy={"server": PROXY_SERVER} if IS_PROXY else None
     )
+    # patchright 兼容：init script 挂在 context 上，不要挂在 page 上
+    context.add_init_script(STEALTH_JS)
     page = context.new_page()
-    page.add_init_script(STEALTH_JS)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
-        if not login(page, email, password, cookie_value):
+        if not login(page, context, email, password, cookie_value):
             status = "❌ 登录失败"
             return (status, old_due, new_due)
 
@@ -771,7 +768,6 @@ def process_account(identifier, email, password, cookie_value, browser):
 # 主流程
 # =========================================================
 def main():
-    # --- 解析账号 ---
     if ACCOUNTS_JSON:
         try:
             accounts = json.loads(ACCOUNTS_JSON)
