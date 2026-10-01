@@ -3,95 +3,122 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 05 * * 3'   # 每周三 05:30 UTC，可根据需要修改
+    # 每周日 23:30 UTC（按需要修改星期几）
+    - cron: '30 23 * * 0'
 
 permissions:
-  actions: write
-  contents: read
+  contents: write   # 需要 push time.txt
+  actions: write    # 需要删除旧 run
+
+# 防止定时任务与手动触发并发跑，避免同账号被两个 job 同时操作
+concurrency:
+  group: renew-hidencloud
+  cancel-in-progress: false
 
 jobs:
-  Renew-HidenCloud:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30   # 多账号时 15 分钟不够，改为 30
+  renew-hiden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       - name: ⚙ 设置 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
+          cache: pip
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-          pip install playwright requests 'requests[socks]'
-          python -m playwright install --with-deps chromium
+          pip install --upgrade pip
+          pip install patchright requests 'requests[socks]'
+          python -m patchright install --with-deps chrome
 
-      - name: ⚙ 设置代理 (sing-box)
+      - name: ⚙ 启动 sing-box 代理
+        # 用仓库内脚本替代原来的第三方远程脚本
+        # 请把审计过的 setup_proxy.sh 放到 scripts/ 目录
+        continue-on-error: true
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}   # 代理节点链接，需在 Secrets 中配置
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          if [ -f scripts/setup_proxy.sh ]; then
+            bash scripts/setup_proxy.sh
+          else
+            echo "::warning::未找到 scripts/setup_proxy.sh，跳过代理启动"
+          fi
 
       - name: 🚀 运行续期脚本
         id: renew
         continue-on-error: true
         env:
-          # 多账号 JSON（可选），若配置则忽略下方单账号凭证
+          # 多账号 JSON（若配置则忽略下方单账号凭证）
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
-          # 单账号兼容（可保留，当 ACCOUNTS_JSON 为空时生效）
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
+          # 单账号兼容
+          EMAIL: ${{ secrets.HIDENCLOUD_EMAIL }}
+          PASSWORD: ${{ secrets.HIDENCLOUD_PASSWORD }}
           COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
           # Telegram 通知
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # 代理配置（固定值，因为代理脚本已在本地启动）
+          # 代理配置
           IS_PROXY: 'true'
           PROXY_SERVER: 'socks5://127.0.0.1:1080'
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
-      - name: 📤 上传诊断截图和 HTML
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots-${{ github.run_number }}
-          path: |
-            *.png
-            *.html
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: 🧽 清理进程和临时文件
+      - name: 🕒 更新时间（保持工作流不被暂停）
         if: always()
         run: |
-          pkill -f sing-box || true
-          pkill -f chromedriver || true
-          pkill -f chrome || true
-          pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin main
+          fi
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          # 只删除已完成（completed）的运行，避免误删当前 run
+          # 保留最近 5 条，其余删除
+          runs=$(gh run list \
+            --workflow="${{ github.workflow }}" \
+            --limit=100 \
+            --status completed \
+            --json databaseId \
+            --jq '.[].databaseId')
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt 5 ]; then
               echo "删除运行记录: $run_id"
               gh run delete $run_id || true
             fi
           done
 
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log || true
+
       - name: ❌ 若脚本失败则标记 job 失败
         if: steps.renew.outcome == 'failure'
         run: |
-          echo "续期脚本执行失败，请查看上方日志和 Artifact 截图。"
+          echo "续期脚本执行失败，请查看上方日志。"
           exit 1
