@@ -19,15 +19,12 @@ ACCOUNTS_JSON = os.environ.get('ACCOUNTS_JSON') or ""
 BASE_URL  = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# --- 代理 ---
+# --- 代理配置 ---
 IS_PROXY = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
 
-# =========================================================
-# 基础工具
-# =========================================================
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
@@ -109,7 +106,7 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 # =========================================================
-# Cloudflare Turnstile 处理
+# Cloudflare Turnstile 处理（与单账号脚本完全一致）
 # =========================================================
 TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]'
 TURNSTILE_FRAME_URL_MARKER = 'challenges.cloudflare.com'
@@ -202,7 +199,6 @@ def _overlaps(box, boxes, dx=25, dy=25, dw=60):
 def challenge_frames(page):
     targets = []
     seen = []
-
     try:
         for f in page.frames:
             if TURNSTILE_FRAME_URL_MARKER not in (f.url or ''):
@@ -287,7 +283,6 @@ def page_ready(p):
 def solve_turnstile(page, timeout=120, success_check=None,
                     require_positive=False, appear_grace=5, reload_after=None,
                     shot_on_timeout="turnstile_timeout.png"):
-
     log("🛡️ 开始处理 Turnstile...")
     start = time.time()
     baseline = turnstile_state(page)
@@ -396,14 +391,14 @@ def solve_turnstile(page, timeout=120, success_check=None,
 
 
 # =========================================================
-# 登录
+# 登录（多账号版：email / password / cookie 通过参数传入）
 # =========================================================
-def login(page, context, email, password, cookie_value):
-    # 1. Cookie 登录
+def login(page, email, password, cookie_value):
+    # 1. Cookie 登录尝试
     if cookie_value:
         log("📇 尝试 Cookie 登录...")
         try:
-            context.add_cookies([{
+            page.context.add_cookies([{
                 'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
                 'value': cookie_value,
                 'domain': 'dash.hidencloud.com',
@@ -415,7 +410,8 @@ def login(page, context, email, password, cookie_value):
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
             solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8)
-            log(f"📝 当前Title: {page.title()}")
+            page_title = page.title()
+            log(f"📝 当前Title: {page_title}")
             if "auth/login" not in page.url:
                 log("✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
@@ -423,13 +419,13 @@ def login(page, context, email, password, cookie_value):
         except Exception as e:
             log(f"⚠️ Cookie 登录异常: {e}")
         try:
-            context.clear_cookies()
+            page.context.clear_cookies()
         except Exception:
             pass
 
     # 2. 账号密码登录
     if not email or not password:
-        log("❌ 无账号密码可用")
+        log("❌ 该账号缺少 email/password，无法登录")
         return False
 
     log("💣 尝试账号密码登录...")
@@ -442,7 +438,7 @@ def login(page, context, email, password, cookie_value):
             except Exception:
                 return False
 
-        log("🛡️ 处理登录页第一道 Turnstile 验证...")
+        log("🛡️ 处理登录页第一道 Turnstile验证...")
         if not solve_turnstile(page, timeout=180, success_check=login_form_visible,
                                reload_after=8,
                                shot_on_timeout="login_turnstile1_fail.png"):
@@ -498,7 +494,8 @@ def login(page, context, email, password, cookie_value):
 
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        log(f"📝 当前Title: {page.title()}")
+        page_title = page.title()
+        log(f"📝 当前Title: {page_title}")
         if "auth/login" in page.url:
             log("❌ 登录失败。")
             try:
@@ -701,23 +698,21 @@ def renew_service(page, service_url):
 
 
 # =========================================================
-# 单账号处理
+# 单账号处理（完全沿用单账号脚本里的浏览器创建方式）
 # =========================================================
 def process_account(identifier, email, password, cookie_value, browser):
     log(f"===== 开始处理账号: {mask_email(email) or identifier} =====")
 
-    # patchright 兼容：显式 viewport，避免 no_viewport=True 触发 Page._options 属性错误
     context = browser.new_context(
-        viewport={'width': 1920, 'height': 1080},
+        no_viewport=True,
         proxy={"server": PROXY_SERVER} if IS_PROXY else None
     )
-    # patchright 兼容：init script 挂在 context 上，不要挂在 page 上
-    context.add_init_script(STEALTH_JS)
     page = context.new_page()
+    page.add_init_script(STEALTH_JS)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
-        if not login(page, context, email, password, cookie_value):
+        if not login(page, email, password, cookie_value):
             status = "❌ 登录失败"
             return (status, old_due, new_due)
 
