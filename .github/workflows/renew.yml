@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # 每周日 23:30 UTC（按需要修改星期几）
-    - cron: '30 23 * * 0'
+    - cron: '30 23 * * 2'
 
 permissions:
   contents: write   # 需要 push time.txt
