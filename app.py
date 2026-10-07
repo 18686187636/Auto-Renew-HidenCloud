@@ -19,7 +19,6 @@ ACCOUNTS_JSON = os.environ.get('ACCOUNTS_JSON') or ""
 BASE_URL  = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# --- 代理配置 ---
 IS_PROXY = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -64,11 +63,6 @@ try {
 
 
 def apply_stealth(page):
-    """
-    注入 stealth script。
-    patchright 里 page.add_init_script() 对多 context 场景会报
-    'Page' object has no attribute '_options'，此时回退到 CDP 注入。
-    """
     try:
         page.add_init_script(STEALTH_JS)
         return True
@@ -76,7 +70,6 @@ def apply_stealth(page):
         log(f"⚠️ page.add_init_script 触发 patchright bug: {e}，改用 CDP 注入")
     except Exception as e:
         log(f"⚠️ page.add_init_script 失败: {e}，改用 CDP 注入")
-
     try:
         client = page.context.new_cdp_session(page)
         client.send('Page.addScriptToEvaluateOnNewDocument', {'source': STEALTH_JS})
@@ -103,10 +96,8 @@ def send_telegram_notification(status, old_due, new_due, email):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
-
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
         f"{status}\n"
@@ -130,7 +121,7 @@ def send_telegram_notification(status, old_due, new_due, email):
 
 
 # =========================================================
-# Cloudflare Turnstile 处理（与单账号脚本一致）
+# Cloudflare Turnstile 处理
 # =========================================================
 TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]'
 TURNSTILE_FRAME_URL_MARKER = 'challenges.cloudflare.com'
@@ -238,7 +229,6 @@ def challenge_frames(page):
                 continue
     except Exception:
         pass
-
     try:
         for el in page.locator(TURNSTILE_IFRAME_SEL).all():
             try:
@@ -253,7 +243,6 @@ def challenge_frames(page):
                 continue
     except Exception:
         pass
-
     return targets
 
 
@@ -295,11 +284,42 @@ def challenge_boxes(page):
 
 
 def page_ready(p):
+    """页面既不是 CF 拦截页，也不在登录页"""
     try:
         t = (p.title() or "").lower()
         blocked = ("just a moment", "attention required", "checking your browser",
                    "请稍候", "security verification", "请验证")
-        return bool(t) and not any(k in t for k in blocked)
+        if not t or any(k in t for k in blocked):
+            return False
+        url = (p.url or "").lower()
+        if "auth/login" in url:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def login_form_visible(p):
+    """登录表单已出现：username 和 password 两个输入框同时可见"""
+    try:
+        url = p.url or ""
+        if "auth/login" not in url:
+            return True  # 已经离开登录页
+        try:
+            has_user = p.locator(
+                'input[name="username"], input#username, input[name="email"], '
+                'input[type="email"], input[name="EMAIL"]'
+            ).first.is_visible()
+        except Exception:
+            has_user = False
+        try:
+            has_pwd = p.locator(
+                'input[name="password"], input#password, '
+                'input[name="PASSWORD"], input[type="password"]'
+            ).first.is_visible()
+        except Exception:
+            has_pwd = False
+        return bool(has_user and has_pwd)
     except Exception:
         return False
 
@@ -307,6 +327,11 @@ def page_ready(p):
 def solve_turnstile(page, timeout=120, success_check=None,
                     require_positive=False, appear_grace=5, reload_after=None,
                     shot_on_timeout="turnstile_timeout.png"):
+    """
+    处理 Cloudflare Turnstile。
+    关键：如果调用方提供了 success_check，只有 success_check 返回 True 才算通过。
+    "token 已生成" / "挑战框消失" 只在没有 success_check 时才作为兜底信号。
+    """
     log("🛡️ 开始处理 Turnstile...")
     start = time.time()
     baseline = turnstile_state(page)
@@ -317,6 +342,7 @@ def solve_turnstile(page, timeout=120, success_check=None,
     reload_done = 0
 
     while time.time() - start < timeout:
+        # 信号 1：调用方自定义判定（最高优先级，唯一权威）
         if success_check is not None:
             try:
                 if success_check(page):
@@ -325,11 +351,13 @@ def solve_turnstile(page, timeout=120, success_check=None,
             except Exception:
                 pass
 
-        st = turnstile_state(page)
-        if st["total"] > 0 and st["solved"] >= st["total"] and (
-                st["total"] > baseline["total"] or st["solved"] > baseline["solved"]):
-            log(f"✅ Turnstile 验证通过（token 已生成 {st['solved']}/{st['total']}）！")
-            return True
+        # 只有在没有 success_check 的时候才启用以下兜底信号
+        if success_check is None:
+            st = turnstile_state(page)
+            if st["total"] > 0 and st["solved"] >= st["total"] and (
+                    st["total"] > baseline["total"] or st["solved"] > baseline["solved"]):
+                log(f"✅ Turnstile 验证通过（token 已生成 {st['solved']}/{st['total']}）！")
+                return True
 
         frames = challenge_frames(page)
         seen = [b for _, b in frames]
@@ -345,7 +373,8 @@ def solve_turnstile(page, timeout=120, success_check=None,
             iframe_gone_since = None
             if container_only_since is None:
                 container_only_since = time.time()
-            elif time.time() - container_only_since >= 12:
+            elif (time.time() - container_only_since >= 12
+                  and success_check is None):
                 log("✅ Turnstile 验证通过（挑战已结束）！")
                 return True
         else:
@@ -353,7 +382,8 @@ def solve_turnstile(page, timeout=120, success_check=None,
             if had_iframe:
                 if iframe_gone_since is None:
                     iframe_gone_since = time.time()
-                elif time.time() - iframe_gone_since >= 8:
+                elif (time.time() - iframe_gone_since >= 8
+                      and success_check is None):
                     log("✅ Turnstile 验证通过（挑战框已消失）！")
                     return True
             elif (not require_positive and success_check is None
@@ -406,7 +436,7 @@ def solve_turnstile(page, timeout=120, success_check=None,
     try:
         cf = [f.url[:100] for f in page.frames if TURNSTILE_FRAME_URL_MARKER in (f.url or '')]
         st = turnstile_state(page)
-        log(f"🔍 超时现场: cf_frames={len(cf)} token={st} title={page.title()!r}")
+        log(f"🔍 超时现场: cf_frames={len(cf)} token={st} title={page.title()!r} url={page.url!r}")
         page.screenshot(path=shot_on_timeout)
         log(f"📸 已保存超时截图: {shot_on_timeout}")
     except Exception:
@@ -433,9 +463,10 @@ def login(page, email, password, cookie_value):
                 'sameSite': 'Lax'
             }])
             page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8)
-            log(f"📝 当前Title: {page.title()}")
-            if "auth/login" not in page.url:
+            # 只有页面真的到了 dashboard（不是 CF 拦截页、不是 auth/login）才算通过
+            passed = solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8)
+            log(f"📝 当前Title: {page.title()}, URL: {page.url}")
+            if passed and "auth/login" not in page.url:
                 log("✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
             log("❌ Cookie 失效，尝试账号密码登录")
@@ -455,13 +486,7 @@ def login(page, email, password, cookie_value):
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
-        def login_form_visible(p):
-            try:
-                return p.locator('input[type="password"]').first.is_visible()
-            except Exception:
-                return False
-
-        log("🛡️ 处理登录页第一道 Turnstile验证...")
+        log("🛡️ 处理登录页第一道 Turnstile 验证...")
         if not solve_turnstile(page, timeout=180, success_check=login_form_visible,
                                reload_after=8,
                                shot_on_timeout="login_turnstile1_fail.png"):
@@ -487,7 +512,7 @@ def login(page, email, password, cookie_value):
         pwd_input.click()
         pwd_input.fill(password)
 
-        log("⏳ 输入完成，等待turnstile加载...")
+        log("⏳ 输入完成，等待 turnstile 加载...")
         time.sleep(8)
 
         log("🛡️ 处理第二道 Turnstile...")
@@ -516,8 +541,8 @@ def login(page, email, password, cookie_value):
             pass
 
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        log(f"📝 当前Title: {page.title()}")
+        solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8)
+        log(f"📝 当前Title: {page.title()}, URL: {page.url}")
         if "auth/login" in page.url:
             log("❌ 登录失败。")
             try:
@@ -574,7 +599,7 @@ def get_due_date(page, service_url):
         if service_url not in page.url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        time.sleep(3)  # 给页面渲染时间
+        time.sleep(3)
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -601,7 +626,7 @@ def renew_service(page, service_url):
         if page.url != service_url:
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        time.sleep(3)  # 给页面渲染 Renew 按钮时间
+        time.sleep(3)
 
         log("🖱️ 准备点击 'Renew' 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
@@ -746,7 +771,6 @@ def process_account(identifier, email, password, cookie_value, browser):
             pass
         return ("❌ 创建页面失败", "未知", "未知")
 
-    # 注入 stealth（patchright 对多次 add_init_script 有 bug，失败时回退 CDP）
     apply_stealth(page)
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
