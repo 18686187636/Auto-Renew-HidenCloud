@@ -9,7 +9,6 @@ except ImportError:
     from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
-COOKIE_VALUE  = os.environ.get('COOKIE_VALUE') or ""
 EMAIL         = os.environ.get('EMAIL') or ""
 PASSWORD      = os.environ.get('PASSWORD') or ""
 TG_CHAT_ID    = os.environ.get('TG_CHAT_ID') or ""
@@ -284,15 +283,18 @@ def challenge_boxes(page):
 
 
 def page_ready(p):
-    """页面既不是 CF 拦截页，也不在登录页"""
+    """页面既不是 CF 拦截页，也不在登录页，也不是浏览器错误页"""
     try:
+        url = (p.url or "").lower()
+        # ✅ 关键修复：浏览器错误页（代理挂掉、DNS 失败等）绝不算 ready
+        if url.startswith("chrome-error://") or url.startswith("about:"):
+            return False
+        if "auth/login" in url:
+            return False
         t = (p.title() or "").lower()
         blocked = ("just a moment", "attention required", "checking your browser",
                    "请稍候", "security verification", "请验证")
         if not t or any(k in t for k in blocked):
-            return False
-        url = (p.url or "").lower()
-        if "auth/login" in url:
             return False
         return True
     except Exception:
@@ -445,41 +447,11 @@ def solve_turnstile(page, timeout=120, success_check=None,
 
 
 # =========================================================
-# 登录
+# 登录（仅账号密码）
 # =========================================================
-def login(page, email, password, cookie_value):
-    # 1. Cookie 登录尝试
-    if cookie_value:
-        log("📇 尝试 Cookie 登录...")
-        try:
-            page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': cookie_value,
-                'domain': 'dash.hidencloud.com',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            # 只有页面真的到了 dashboard（不是 CF 拦截页、不是 auth/login）才算通过
-            passed = solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8)
-            log(f"📝 当前Title: {page.title()}, URL: {page.url}")
-            if passed and "auth/login" not in page.url:
-                log("✅ Cookie 登录成功！当前已到达dashboard页面")
-                return True
-            log("❌ Cookie 失效，尝试账号密码登录")
-        except Exception as e:
-            log(f"⚠️ Cookie 登录异常: {e}")
-        try:
-            page.context.clear_cookies()
-        except Exception:
-            pass
-
-    # 2. 账号密码登录
+def login(page, email, password):
     if not email or not password:
-        log("❌ 该账号缺少 email/password，无法登录")
+        log("❌ 缺少 email/password，无法登录")
         return False
 
     log("💣 尝试账号密码登录...")
@@ -543,7 +515,9 @@ def login(page, email, password, cookie_value):
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8)
         log(f"📝 当前Title: {page.title()}, URL: {page.url}")
-        if "auth/login" in page.url:
+
+        # ✅ 双重校验：URL 不能是登录页，也不能是错误页
+        if "auth/login" in page.url or page.url.startswith("chrome-error://"):
             log("❌ 登录失败。")
             try:
                 page.screenshot(path="login_fail.png")
@@ -749,7 +723,7 @@ def renew_service(page, service_url):
 # =========================================================
 # 单账号处理
 # =========================================================
-def process_account(identifier, email, password, cookie_value, browser):
+def process_account(identifier, email, password, browser):
     log(f"===== 开始处理账号: {mask_email(email) or identifier} =====")
 
     try:
@@ -775,7 +749,7 @@ def process_account(identifier, email, password, cookie_value, browser):
 
     status, old_due, new_due = "❌ 未知错误", "未知", "未知"
     try:
-        if not login(page, email, password, cookie_value):
+        if not login(page, email, password):
             status = "❌ 登录失败"
             return (status, old_due, new_due)
 
@@ -817,6 +791,10 @@ def process_account(identifier, email, password, cookie_value, browser):
         except Exception as e:
             log(f"⚠️ 通知失败: {e}")
         try:
+            reset_cdp_session(page)
+        except Exception:
+            pass
+        try:
             context.close()
         except Exception:
             pass
@@ -837,10 +815,10 @@ def main():
             sys.exit(1)
         log(f"📋 多账号模式，共 {len(accounts)} 个账号")
     else:
-        if not COOKIE_VALUE and not (EMAIL and PASSWORD):
-            log("❌ 缺少登录凭证")
+        if not (EMAIL and PASSWORD):
+            log("❌ 缺少 EMAIL 或 PASSWORD")
             sys.exit(1)
-        accounts = [{"email": EMAIL, "password": PASSWORD, "cookie": COOKIE_VALUE}]
+        accounts = [{"email": EMAIL, "password": PASSWORD}]
         log("📋 单账号模式")
 
     with sync_playwright() as p:
@@ -867,16 +845,15 @@ def main():
             for idx, acc in enumerate(accounts):
                 email = acc.get('email', '')
                 password = acc.get('password', '')
-                cookie = acc.get('cookie', '')
                 identifier = email or f"账号{idx+1}"
 
-                if not cookie and not (email and password):
-                    log(f"⚠️ 第 {idx+1} 个账号缺少凭证，跳过")
+                if not (email and password):
+                    log(f"⚠️ 第 {idx+1} 个账号缺少 email/password，跳过")
                     all_success = False
                     continue
 
                 log(f"\n===== [{idx+1}/{total}] =====")
-                status, _, _ = process_account(identifier, email, password, cookie, browser)
+                status, _, _ = process_account(identifier, email, password, browser)
 
                 if status not in ("✅ 续期成功", "⏳ 未到续期时间"):
                     all_success = False
