@@ -3,14 +3,13 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    # 每周日 23:30 UTC（按需要修改星期几）
-    - cron: '30 23 * * 2'
+    - cron: '30 23 * * 3'
 
 permissions:
-  contents: write   # 需要 push time.txt
-  actions: write    # 需要删除旧 run
+  contents: write   
+  actions: write    
 
-# 防止定时任务与手动触发并发跑，避免同账号被两个 job 同时操作
+
 concurrency:
   group: renew-hidencloud
   cancel-in-progress: false
